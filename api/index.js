@@ -29,7 +29,7 @@ const GEMINI_API_KEY = process.env.GEMINI_API_KEY || ''
 
 const RAW_PREFIX    = 'raw'
 const CHUNK_SIZE    = 500   // characters per chunk
-const CHUNK_OVERLAP = 80    // overlap between chunks
+const CHUNK_OVERLAP = 2     // number of lines to carry over as overlap context
 
 const SYSTEM_PROMPT =
   "You are a helpful assistant. Answer the user's question using ONLY " +
@@ -221,11 +221,33 @@ async function extractWord(buffer) {
   return result.value || ''
 }
 
+// ── FIX: Row-aware spreadsheet extraction ────────────────────────────────────
+// OLD approach used sheet_to_csv which produced a flat TSV blob — the chunker
+// then sliced it every 500 chars, splitting measure names from their
+// descriptions. Now every row becomes a fully-labelled "Key: Value | Key: Value"
+// line so each chunk is self-contained and the LLM can always see which table,
+// measure name, description, and formula belong together.
 function extractSpreadsheet(buffer) {
   const workbook = XLSX.read(buffer, { type: 'buffer' })
-  return workbook.SheetNames
-    .map(name => `=== Sheet: ${name} ===\n` + XLSX.utils.sheet_to_csv(workbook.Sheets[name], { FS: '\t' }))
-    .join('\n\n')
+  const parts = []
+
+  for (const name of workbook.SheetNames) {
+    // sheet_to_json gives us [{colHeader: cellValue, ...}, ...] per row
+    const rows = XLSX.utils.sheet_to_json(workbook.Sheets[name], { defval: '' })
+    if (!rows.length) continue
+    parts.push(`=== Sheet: ${name} ===`)
+
+    for (const row of rows) {
+      // Serialise every non-empty cell as "ColumnName: Value"
+      const line = Object.entries(row)
+        .filter(([, v]) => String(v).trim() !== '')
+        .map(([k, v]) => `${k}: ${String(v).replace(/\s+/g, ' ').trim()}`)
+        .join(' | ')
+      if (line.length > 10) parts.push(line)
+    }
+  }
+
+  return parts.join('\n')
 }
 
 function extractCsv(buffer, delimiter = ',') {
@@ -339,16 +361,67 @@ async function extractTextFromBuffer(buffer, fileName) {
 // ════════════════════════════════════════════════════════════════════════════
 //  CHUNKING
 // ════════════════════════════════════════════════════════════════════════════
+
+// ── FIX: Line-aware chunking ─────────────────────────────────────────────────
+// OLD approach sliced raw text every 500 characters, blindly cutting through
+// row entries so a measure's name ended up in one chunk and its description
+// in the next. The LLM then saw neither as a complete definition.
+//
+// NEW approach:
+//  • Splits on newlines, never inside a line.
+//  • Accumulates lines until adding the next line would exceed CHUNK_SIZE.
+//  • Carries the last CHUNK_OVERLAP lines into the next chunk so cross-chunk
+//    context (e.g. a sheet header line) is not lost entirely.
+//  • For spreadsheet data this means each chunk contains only whole
+//    "Table: X | Measure: Y | Description: Z" records — fully answerable
+//    by the LLM without needing to stitch adjacent chunks together.
 function chunkText(text, sourceFile) {
   const chunks = []
-  let i = 0, index = 0
-  text = text.replace(/\r\n/g, '\n').replace(/[ \t]+/g, ' ').trim()
-  while (i < text.length) {
-    const fragment = text.slice(i, Math.min(i + CHUNK_SIZE, text.length)).trim()
-    if (fragment.length > 30)
-      chunks.push({ text: fragment, source_file: sourceFile, chunk_index: index++, embedding: [] })
-    i += CHUNK_SIZE - CHUNK_OVERLAP
+  let index = 0
+
+  // Normalise line endings and collapse runs of blank lines
+  const lines = text
+    .replace(/\r\n/g, '\n')
+    .split('\n')
+    .map(l => l.trim())
+    .filter(l => l.length > 0)
+
+  let buffer = []   // array of lines currently accumulated
+
+  for (const line of lines) {
+    const projectedLength = buffer.join('\n').length + (buffer.length ? 1 : 0) + line.length
+
+    if (buffer.length > 0 && projectedLength > CHUNK_SIZE) {
+      // Flush current buffer as a chunk
+      const chunkText = buffer.join('\n')
+      if (chunkText.length > 30) {
+        chunks.push({
+          text: chunkText,
+          source_file: sourceFile,
+          chunk_index: index++,
+          embedding: [],
+        })
+      }
+      // Carry the last CHUNK_OVERLAP lines into the next chunk for context
+      buffer = buffer.slice(-CHUNK_OVERLAP)
+    }
+
+    buffer.push(line)
   }
+
+  // Flush any remaining lines
+  if (buffer.length > 0) {
+    const chunkText = buffer.join('\n')
+    if (chunkText.length > 30) {
+      chunks.push({
+        text: chunkText,
+        source_file: sourceFile,
+        chunk_index: index++,
+        embedding: [],
+      })
+    }
+  }
+
   return chunks
 }
 
