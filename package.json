@@ -5,7 +5,7 @@
   "main": "api/index.js",
   "type": "commonjs",
   "scripts": {
-    "dev": "node api/index.js",
+    "dev": "nodemon api/index.js",
     "start": "node api/index.js"
   },
   "engines": {
@@ -19,6 +19,17 @@
     "dotenv": "^16.4.5",
     "express": "^4.19.2",
     "jsonwebtoken": "^9.0.2",
-    "mongodb": "^6.7.0"
+    "mongodb": "^6.7.0",
+    "pdf-parse": "^1.1.1",
+    "mammoth": "^1.7.0",
+    "xlsx": "^0.18.5",
+    "node-html-parser": "^6.1.13",
+    "js-yaml": "^4.1.0",
+    "papaparse": "^5.4.1",
+    "mailparser": "^3.6.8",
+    "officeparser": "^4.0.0"
+  },
+  "devDependencies": {
+    "nodemon": "^3.1.0"
   }
 }
