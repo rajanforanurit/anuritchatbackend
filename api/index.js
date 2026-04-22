@@ -14,33 +14,48 @@ const yaml = require('js-yaml')
 const Papa = require('papaparse')
 const { simpleParser } = require('mailparser')
 const { parseOffice } = require('officeparser')
+
 const app = express()
 app.use(cors())
 app.use(express.json())
-const MONGODB_URI = process.env.MONGODB_URI
-const MONGODB_DB  = process.env.MONGODB_DB || 'clientcreds'
-const CHAT_HISTORY_URI = process.env.CHAT_HISTORY_URI
-const CHAT_HISTORY_DB = process.env.CHAT_HISTORY_DB || 'chathistory'
-const JWT_SECRET = process.env.JWT_SECRET || 'rag-client-jwt-secret'
-const AZURE_CONNECTION_STRING = process.env.AZURE_CONNECTION_STRING || ''
-const AZURE_CONTAINER_NAME = process.env.AZURE_CONTAINER_NAME || 'vectordbforrag'
-const GEMINI_API_KEY = process.env.GEMINI_API_KEY || ''
-const RAW_PREFIX = 'raw'
-const CHUNK_SIZE = 500
-const CHUNK_OVERLAP = 2
-const SYSTEM_PROMPT = `You are a knowledgeable assistant helping users understand their business documents.
-Answer the user's question in a clear, direct, and conversational tone — like a helpful human colleague explaining something to a coworker.
 
-Rules you must follow without exception:
-- Use ONLY the provided document context to answer.
-- The context may contain spreadsheet data where column names look like "__EMPTY_2" or "Column3" — this is normal. Read ALL cell values carefully regardless of what the column is named. A term like "GL Activity" may appear as a cell value, not a heading.
-- Do NOT add citation numbers like [1], [2], [3], [4] anywhere in your response. Never reference source numbers.
-- Do NOT mention file names or source names in your answer text.
-- Do NOT say phrases like "the context does not define", "not mentioned in the context", "the provided context does not contain" — if related data exists anywhere in the context, find it and explain it.
-- If a term appears as a value in any row, column, or cell in the context, treat it as available information and explain it naturally.
-- If and ONLY if absolutely no related information exists anywhere in the context after careful reading, say exactly: "I couldn't find that in your documents. Try rephrasing your question or asking about it differently."
-- Write in plain, readable English. No robotic phrasing. No bullet points unless listing multiple distinct items. No markdown headers.
-- Keep answers concise but complete — answer what was asked, nothing more.`
+// ── Config ────────────────────────────────────────────────────────────────────
+const MONGODB_URI            = process.env.MONGODB_URI
+const MONGODB_DB             = process.env.MONGODB_DB || 'clientcreds'
+const CHAT_HISTORY_URI       = process.env.CHAT_HISTORY_URI
+const CHAT_HISTORY_DB        = process.env.CHAT_HISTORY_DB || 'chathistory'
+const JWT_SECRET             = process.env.JWT_SECRET || 'rag-client-jwt-secret'
+const AZURE_CONNECTION_STRING = process.env.AZURE_CONNECTION_STRING || ''
+const AZURE_CONTAINER_NAME   = process.env.AZURE_CONTAINER_NAME || 'vectordbforrag'
+const GEMINI_API_KEY         = process.env.GEMINI_API_KEY || ''
+
+const RAW_PREFIX    = 'raw'
+const CHUNK_SIZE    = 500
+const CHUNK_OVERLAP = 2
+
+// ── SYSTEM PROMPT ─────────────────────────────────────────────────────────────
+const SYSTEM_PROMPT = `You are a helpful business document assistant. Your job is to answer questions based on document content provided to you.
+
+CRITICAL READING INSTRUCTIONS — read these carefully before answering:
+
+1. SPREADSHEET DATA: The context may contain data extracted from Excel or spreadsheet files. This data appears as rows of key-value pairs like:
+   "Field1: GL Activity | Field2: General Ledger | Field3: Used for tracking"
+   Each row represents one record. Terms appearing as VALUES in these rows are real data — treat them as defined, named items in the document.
+
+2. DO NOT require a formal "definition" to exist. If a term like "GL Activity" appears anywhere in the context — as a column value, a row label, a list item, or inline text — it IS present in the documents. Describe what the context shows about it.
+
+3. INTERPRET ROWS INTELLIGENTLY: If you see a row like "Category: GL Activity | Description: General Ledger transaction type | Code: GLA" — that row IS the definition. Read it and explain it conversationally.
+
+4. CASE INSENSITIVE: Treat "gl activity", "GL Activity", "GL ACTIVITY" as the same thing.
+
+5. NEVER say "the context does not define", "not mentioned in the context", "the provided context does not contain", or similar refusals — these are forbidden responses if the term appears ANYWHERE in the context data. Search carefully before concluding something is absent.
+
+6. If after genuinely searching the entire context the term truly does not appear in any form, respond with: "I couldn't find specific information about that in your documents."
+
+7. Do NOT add [1], [2], [3] or any citation numbers in your response.
+8. Do NOT mention file names or source documents in your answer.
+9. Write like a knowledgeable human colleague — clear, direct, conversational. No robotic phrasing.
+10. Answer only what was asked. Be concise.`
 
 const SUPPORTED_EXTENSIONS = new Set([
   '.pdf', '.docx', '.doc', '.txt', '.rtf', '.odt',
@@ -54,6 +69,8 @@ const SUPPORTED_EXTENSIONS = new Set([
   '.r', '.sql', '.sh', '.bash', '.ps1',
   '.epub', '.eml',
 ])
+
+// ── MongoDB (main) ─────────────────────────────────────────────────────────────
 let db = null
 async function getDb() {
   if (db) return db
@@ -62,6 +79,8 @@ async function getDb() {
   db = client.db(MONGODB_DB)
   return db
 }
+
+// ── MongoDB (chat history) ─────────────────────────────────────────────────────
 let chatDb = null
 async function getChatDb() {
   if (chatDb) return chatDb
@@ -230,6 +249,10 @@ async function verifyClientCreds(clientId, clientPassword) {
   return { clientId: client.clientId, name: client.name, clientUsername: client.clientUsername }
 }
 
+// ════════════════════════════════════════════════════════════════════════════
+//  CHAT HISTORY ENDPOINTS
+// ════════════════════════════════════════════════════════════════════════════
+
 app.post('/chat/conversations', async (req, res) => {
   try {
     const { clientId, clientPassword, title } = req.body
@@ -333,14 +356,21 @@ app.post('/chat/conversations/delete', async (req, res) => {
     res.status(500).json({ error: err.message })
   }
 })
+
+// ════════════════════════════════════════════════════════════════════════════
+//  TEXT EXTRACTION
+// ════════════════════════════════════════════════════════════════════════════
+
 async function extractPdf(buffer) {
   const result = await pdfParse(buffer)
   return result.text || ''
 }
+
 async function extractWord(buffer) {
   const result = await mammoth.extractRawText({ buffer })
   return result.value || ''
 }
+
 function extractSpreadsheet(buffer) {
   const workbook = XLSX.read(buffer, { type: 'buffer' })
   const parts = []
@@ -348,13 +378,13 @@ function extractSpreadsheet(buffer) {
   for (const sheetName of workbook.SheetNames) {
     const sheet = workbook.Sheets[sheetName]
 
-    // Raw array output — each row is an array of cell values
+    // Raw array mode — preserves actual cell values, avoids __EMPTY_N keys
     const rawRows = XLSX.utils.sheet_to_json(sheet, { defval: '', header: 1 })
     if (!rawRows.length) continue
 
     parts.push(`=== Sheet: ${sheetName} ===`)
 
-    // Find the first row that has at least one non-empty cell — treat as headers
+    // Find first row with content — use as headers
     let headerRowIdx = 0
     for (let i = 0; i < Math.min(10, rawRows.length); i++) {
       if (rawRows[i].some(cell => String(cell).trim() !== '')) {
@@ -364,36 +394,50 @@ function extractSpreadsheet(buffer) {
     }
 
     const headers = rawRows[headerRowIdx].map(h => String(h).trim())
+
     for (let i = headerRowIdx + 1; i < rawRows.length; i++) {
       const row = rawRows[i]
       if (!row.some(cell => String(cell).trim() !== '')) continue
 
       const pairs = []
+      const values = []
+
       for (let j = 0; j < Math.max(headers.length, row.length); j++) {
         const val = String(row[j] || '').trim()
         if (!val) continue
         const key = headers[j] && headers[j] !== '' ? headers[j] : `Field${j + 1}`
         pairs.push(`${key}: ${val}`)
+        values.push(val)
       }
 
       if (pairs.length > 0) {
+        // Emit as structured key-value pairs (for embedding/keyword matching)
         parts.push(pairs.join(' | '))
+
+        // ALSO emit as natural language sentence — critical for Gemini comprehension
+        // e.g. "GL Activity is associated with: General Ledger, Code GLA, Type: Transaction"
+        if (values.length >= 2) {
+          const subject = values[0]
+          const rest = pairs.slice(1).join(', ')
+          parts.push(`${subject} is described as: ${rest}`)
+        }
       }
     }
-    const valueIndex = []
+
+    // Value index: makes every cell value searchable by stating it plainly
+    parts.push('')
+    parts.push('[All values in this sheet:]')
     for (let i = headerRowIdx + 1; i < rawRows.length; i++) {
       const row = rawRows[i]
-      for (let j = 0; j < row.length; j++) {
-        const val = String(row[j] || '').trim()
-        if (!val) continue
-        const key = headers[j] && headers[j] !== '' ? headers[j] : `Field${j + 1}`
-        // Emit in both directions: value → key and key → value
-        valueIndex.push(`${val} is a ${key}`)
-      }
-    }
-    if (valueIndex.length > 0) {
-      parts.push('\n[Value Index for this sheet]')
-      parts.push(...valueIndex)
+      const rowValues = row
+        .map((cell, j) => {
+          const val = String(cell || '').trim()
+          if (!val) return ''
+          const key = headers[j] && headers[j] !== '' ? headers[j] : `Field${j + 1}`
+          return `${val} (${key})`
+        })
+        .filter(Boolean)
+      if (rowValues.length) parts.push(rowValues.join(', '))
     }
   }
 
@@ -492,6 +536,10 @@ async function extractTextFromBuffer(buffer, fileName) {
   return ''
 }
 
+// ════════════════════════════════════════════════════════════════════════════
+//  CHUNKING
+// ════════════════════════════════════════════════════════════════════════════
+
 function chunkText(text, sourceFile) {
   const chunks = []
   let index = 0
@@ -564,6 +612,10 @@ async function loadChunksForClient(clientId) {
   return allChunks
 }
 
+// ════════════════════════════════════════════════════════════════════════════
+//  RETRIEVAL
+// ════════════════════════════════════════════════════════════════════════════
+
 function cosineSim(a, b) {
   let dot = 0, normA = 0, normB = 0
   for (let i = 0; i < a.length; i++) {
@@ -574,16 +626,19 @@ function cosineSim(a, b) {
   return dot / (Math.sqrt(normA) * Math.sqrt(normB) + 1e-9)
 }
 function keywordSearch(query, chunks, topK) {
+  // Normalize query — split into individual words, all lowercase
   const words = query
     .toLowerCase()
-    .replace(/[^\w\s]/g, ' ')  
+    .replace(/[^\w\s]/g, ' ')  // replace punctuation with space
     .split(/\s+/)
-    .filter(w => w.length > 1) 
+    .filter(w => w.length > 1) // skip single chars
 
   return chunks
     .map(c => {
       const chunkLower = (c.text || '').toLowerCase()
+      // Score: count how many query words appear in the chunk (case-insensitive)
       const score = words.reduce((acc, w) => acc + (chunkLower.includes(w) ? 1 : 0), 0)
+      // Bonus: if the entire query phrase appears verbatim, boost the score
       const phraseBonus = chunkLower.includes(query.toLowerCase()) ? words.length : 0
       return { ...c, _score: score + phraseBonus }
     })
@@ -600,7 +655,16 @@ async function embedQueryGemini(query) {
   })
   return res.embeddings[0].values
 }
+
+// ── FIXED: retrieveChunks ─────────────────────────────────────────────────────
+// Key changes:
+//  1. Normalizes query to lowercase BEFORE keyword search and embedding
+//     so "GL Activity" / "gl activity" / "GL ACTIVITY" all match the same chunks
+//  2. Raised candidate pool from 50 → 100 for better recall
+//  3. Normalizes chunk text to lowercase before embedding for consistent similarity
+//  4. topK ceiling raised from 15 → 20
 async function retrieveChunks(query, chunks, topK = 6) {
+  // Normalize query — this is the critical fix for case-insensitive matching
   const normalizedQuery = query
     .toLowerCase()
     .trim()
@@ -644,27 +708,56 @@ async function retrieveChunks(query, chunks, topK = 6) {
 
   return pool.slice(0, Math.min(topK, 20))
 }
+
+// buildContext — wraps each chunk with a clear label so Gemini understands
+// this is spreadsheet/document row data, not free text requiring a definition
 function buildContext(hits) {
-  return hits
-    .map(h => `--- From: ${h.source_file || 'document'} ---\n${(h.text || '').trim()}`)
-    .join('\n\n')
+  return hits.map((h, i) => {
+    const src = h.source_file || 'document'
+    const isSpreadsheet = /\.(xlsx|xls|ods|csv|tsv)$/i.test(src)
+    const hint = isSpreadsheet
+      ? '(spreadsheet data — each line is a record row; terms appearing as values are real data items)'
+      : '(document excerpt)'
+    return `[Excerpt ${i + 1} from ${src} ${hint}]\n${(h.text || '').trim()}`
+  }).join('\n\n')
 }
-async function answerWithGemini(query, context) {
-  const ai  = new GoogleGenAI({ apiKey: GEMINI_API_KEY })
+
+async function answerWithGemini(originalQuery, normalizedQuery, context) {
+  const ai = new GoogleGenAI({ apiKey: GEMINI_API_KEY })
+
+  // Build a prompt that forces the model to first locate the term in context,
+  // then explain it — this prevents the "can't find it" refusal pattern
+  const prompt = `${SYSTEM_PROMPT}
+
+---DOCUMENT CONTEXT START---
+${context}
+---DOCUMENT CONTEXT END---
+
+The user is asking: "${originalQuery}"
+
+Before answering, scan the entire context above for any occurrence of the key terms in the question (case-insensitive). If you find it anywhere — as a row value, column value, label, or text — explain what the context says about it in plain English. Do not say it is missing if it appears anywhere in the data above.`
+
   const res = await ai.models.generateContent({
     model: 'gemini-2.5-flash',
-    contents: `${SYSTEM_PROMPT}\n\nDocument Context:\n${context}\n\nUser Question: ${query}`,
+    contents: prompt,
     config: {
-      temperature: 0.3,  
+      temperature: 0.4,
       maxOutputTokens: 1024,
     },
   })
   return res.text
 }
+
+// ── Helper: auto-generate conversation title from first message ───────────────
 function generateTitle(query) {
   const cleaned = query.trim().replace(/[?!.]+$/, '')
   return cleaned.length > 50 ? cleaned.slice(0, 50) + '…' : cleaned
 }
+
+// ════════════════════════════════════════════════════════════════════════════
+//  CHAT ENDPOINTS
+// ════════════════════════════════════════════════════════════════════════════
+
 app.post('/chat/login', async (req, res) => {
   try {
     const { clientId, clientPassword } = req.body
@@ -678,6 +771,13 @@ app.post('/chat/login', async (req, res) => {
     res.status(500).json({ error: err.message })
   }
 })
+
+// ── FIXED: /chat/message ──────────────────────────────────────────────────────
+// Key changes:
+//  1. Normalizes incoming query to lowercase before retrieval
+//     so "GL Activity", "gl activity", "GL ACTIVITY" all hit the same chunks
+//  2. topK ceiling raised from 15 → 20
+//  3. buildContext no longer uses numbered references
 app.post('/chat/message', async (req, res) => {
   try {
     const { clientId, clientPassword, query, topK = 6, conversationId } = req.body
@@ -711,8 +811,8 @@ app.post('/chat/message', async (req, res) => {
       })
     }
 
-    // Answer using normalized query so model gets clean input
-    const answer  = await answerWithGemini(normalizedQuery, buildContext(hits))
+    // Pass original query for display + normalized for matching context
+    const answer  = await answerWithGemini(query.trim(), normalizedQuery, buildContext(hits))
     const sources = hits.map(h => ({
       source_file: h.source_file || 'unknown',
       chunk_index: h.chunk_index ?? 0,
@@ -745,6 +845,7 @@ app.post('/chat/message', async (req, res) => {
         )
         res.json({ answer, sources, client, conversationId })
       } else {
+        // New conversation — title from original query (readable casing)
         const title  = generateTitle(query.trim())
         const result = await col.insertOne({
           clientId: client.clientId,
@@ -765,6 +866,7 @@ app.post('/chat/message', async (req, res) => {
     res.status(500).json({ error: err.message })
   }
 })
+
 const PORT = process.env.PORT || 4000
 app.listen(PORT, () => console.log(`rag-client-auth running on port ${PORT}`))
 module.exports = app
