@@ -333,16 +333,10 @@ app.post('/chat/conversations/delete', async (req, res) => {
     res.status(500).json({ error: err.message })
   }
 })
-
-// ════════════════════════════════════════════════════════════════════════════
-//  TEXT EXTRACTION
-// ════════════════════════════════════════════════════════════════════════════
-
 async function extractPdf(buffer) {
   const result = await pdfParse(buffer)
   return result.text || ''
 }
-
 async function extractWord(buffer) {
   const result = await mammoth.extractRawText({ buffer })
   return result.value || ''
@@ -370,19 +364,14 @@ function extractSpreadsheet(buffer) {
     }
 
     const headers = rawRows[headerRowIdx].map(h => String(h).trim())
-
-    // Emit each data row as "Header: Value | Header: Value" pairs
     for (let i = headerRowIdx + 1; i < rawRows.length; i++) {
       const row = rawRows[i]
-
-      // Skip completely empty rows
       if (!row.some(cell => String(cell).trim() !== '')) continue
 
       const pairs = []
       for (let j = 0; j < Math.max(headers.length, row.length); j++) {
         const val = String(row[j] || '').trim()
         if (!val) continue
-        // If the header is blank/generic, just emit the value with its position context
         const key = headers[j] && headers[j] !== '' ? headers[j] : `Field${j + 1}`
         pairs.push(`${key}: ${val}`)
       }
@@ -391,9 +380,6 @@ function extractSpreadsheet(buffer) {
         parts.push(pairs.join(' | '))
       }
     }
-
-    // Also emit a second pass: for each unique value in the sheet, emit
-    // "value is listed under [header]" so the model can match by value search
     const valueIndex = []
     for (let i = headerRowIdx + 1; i < rawRows.length; i++) {
       const row = rawRows[i]
@@ -506,10 +492,6 @@ async function extractTextFromBuffer(buffer, fileName) {
   return ''
 }
 
-// ════════════════════════════════════════════════════════════════════════════
-//  CHUNKING
-// ════════════════════════════════════════════════════════════════════════════
-
 function chunkText(text, sourceFile) {
   const chunks = []
   let index = 0
@@ -582,10 +564,6 @@ async function loadChunksForClient(clientId) {
   return allChunks
 }
 
-// ════════════════════════════════════════════════════════════════════════════
-//  RETRIEVAL
-// ════════════════════════════════════════════════════════════════════════════
-
 function cosineSim(a, b) {
   let dot = 0, normA = 0, normB = 0
   for (let i = 0; i < a.length; i++) {
@@ -595,25 +573,17 @@ function cosineSim(a, b) {
   }
   return dot / (Math.sqrt(normA) * Math.sqrt(normB) + 1e-9)
 }
-
-// ── FIXED: keywordSearch ──────────────────────────────────────────────────────
-// Now normalizes BOTH query and chunk text to lowercase for matching,
-// and scores partial word matches too (e.g. "gl" matches "GL Activity").
-// Also raised candidate pool from 50 → 100 for better recall on sparse docs.
 function keywordSearch(query, chunks, topK) {
-  // Normalize query — split into individual words, all lowercase
   const words = query
     .toLowerCase()
-    .replace(/[^\w\s]/g, ' ')  // replace punctuation with space
+    .replace(/[^\w\s]/g, ' ')  
     .split(/\s+/)
-    .filter(w => w.length > 1) // skip single chars
+    .filter(w => w.length > 1) 
 
   return chunks
     .map(c => {
       const chunkLower = (c.text || '').toLowerCase()
-      // Score: count how many query words appear in the chunk (case-insensitive)
       const score = words.reduce((acc, w) => acc + (chunkLower.includes(w) ? 1 : 0), 0)
-      // Bonus: if the entire query phrase appears verbatim, boost the score
       const phraseBonus = chunkLower.includes(query.toLowerCase()) ? words.length : 0
       return { ...c, _score: score + phraseBonus }
     })
@@ -630,16 +600,7 @@ async function embedQueryGemini(query) {
   })
   return res.embeddings[0].values
 }
-
-// ── FIXED: retrieveChunks ─────────────────────────────────────────────────────
-// Key changes:
-//  1. Normalizes query to lowercase BEFORE keyword search and embedding
-//     so "GL Activity" / "gl activity" / "GL ACTIVITY" all match the same chunks
-//  2. Raised candidate pool from 50 → 100 for better recall
-//  3. Normalizes chunk text to lowercase before embedding for consistent similarity
-//  4. topK ceiling raised from 15 → 20
 async function retrieveChunks(query, chunks, topK = 6) {
-  // Normalize query — this is the critical fix for case-insensitive matching
   const normalizedQuery = query
     .toLowerCase()
     .trim()
@@ -683,40 +644,27 @@ async function retrieveChunks(query, chunks, topK = 6) {
 
   return pool.slice(0, Math.min(topK, 20))
 }
-
-// ── FIXED: buildContext ───────────────────────────────────────────────────────
-// Old version used [1], [2], [3] numbering which the model would echo back
-// in its answer as citation references. Now uses plain document separators
-// with no numbers, so the model has no numbers to cite.
 function buildContext(hits) {
   return hits
     .map(h => `--- From: ${h.source_file || 'document'} ---\n${(h.text || '').trim()}`)
     .join('\n\n')
 }
-
 async function answerWithGemini(query, context) {
   const ai  = new GoogleGenAI({ apiKey: GEMINI_API_KEY })
   const res = await ai.models.generateContent({
     model: 'gemini-2.5-flash',
     contents: `${SYSTEM_PROMPT}\n\nDocument Context:\n${context}\n\nUser Question: ${query}`,
     config: {
-      temperature: 0.3,  // slightly raised from 0.2 for more natural language
+      temperature: 0.3,  
       maxOutputTokens: 1024,
     },
   })
   return res.text
 }
-
-// ── Helper: auto-generate conversation title from first message ───────────────
 function generateTitle(query) {
   const cleaned = query.trim().replace(/[?!.]+$/, '')
   return cleaned.length > 50 ? cleaned.slice(0, 50) + '…' : cleaned
 }
-
-// ════════════════════════════════════════════════════════════════════════════
-//  CHAT ENDPOINTS
-// ════════════════════════════════════════════════════════════════════════════
-
 app.post('/chat/login', async (req, res) => {
   try {
     const { clientId, clientPassword } = req.body
@@ -730,13 +678,6 @@ app.post('/chat/login', async (req, res) => {
     res.status(500).json({ error: err.message })
   }
 })
-
-// ── FIXED: /chat/message ──────────────────────────────────────────────────────
-// Key changes:
-//  1. Normalizes incoming query to lowercase before retrieval
-//     so "GL Activity", "gl activity", "GL ACTIVITY" all hit the same chunks
-//  2. topK ceiling raised from 15 → 20
-//  3. buildContext no longer uses numbered references
 app.post('/chat/message', async (req, res) => {
   try {
     const { clientId, clientPassword, query, topK = 6, conversationId } = req.body
@@ -804,7 +745,6 @@ app.post('/chat/message', async (req, res) => {
         )
         res.json({ answer, sources, client, conversationId })
       } else {
-        // New conversation — title from original query (readable casing)
         const title  = generateTitle(query.trim())
         const result = await col.insertOne({
           clientId: client.clientId,
@@ -825,7 +765,6 @@ app.post('/chat/message', async (req, res) => {
     res.status(500).json({ error: err.message })
   }
 })
-
 const PORT = process.env.PORT || 4000
 app.listen(PORT, () => console.log(`rag-client-auth running on port ${PORT}`))
 module.exports = app
