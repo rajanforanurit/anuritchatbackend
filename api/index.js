@@ -3,7 +3,7 @@ const express = require('express')
 const cors = require('cors')
 const jwt = require('jsonwebtoken')
 const bcrypt= require('bcryptjs')
-const { MongoClient } = require('mongodb')
+const { MongoClient, ObjectId } = require('mongodb')
 const { BlobServiceClient } = require('@azure/storage-blob')
 const { GoogleGenAI } = require('@google/genai')
 const pdfParse = require('pdf-parse')
@@ -14,31 +14,26 @@ const yaml = require('js-yaml')
 const Papa = require('papaparse')
 const { simpleParser } = require('mailparser')
 const { parseOffice }  = require('officeparser')
-
 const app = express()
 app.use(cors())
 app.use(express.json())
-
-// ── Config ───────────────────────────────────────────────────────────────────
 const MONGODB_URI = process.env.MONGODB_URI
 const MONGODB_DB  = process.env.MONGODB_DB || 'clientcreds'
+const CHAT_HISTORY_URI = process.env.CHAT_HISTORY_URI
+const CHAT_HISTORY_DB  = process.env.CHAT_HISTORY_DB || 'chathistory'
 const JWT_SECRET = process.env.JWT_SECRET || 'rag-client-jwt-secret'
 const AZURE_CONNECTION_STRING = process.env.AZURE_CONNECTION_STRING || ''
 const AZURE_CONTAINER_NAME = process.env.AZURE_CONTAINER_NAME || 'vectordbforrag'
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY || ''
-
 const RAW_PREFIX    = 'raw'
-const CHUNK_SIZE    = 500   // characters per chunk
-const CHUNK_OVERLAP = 2     // number of lines to carry over as overlap context
-
+const CHUNK_SIZE    = 500
+const CHUNK_OVERLAP = 2
 const SYSTEM_PROMPT =
   "You are a helpful assistant. Answer the user's question using ONLY " +
   'the provided context excerpts from their documents. ' +
   'If the answer is not in the context, say so clearly. ' +
   'Cite the source file in square brackets, e.g. [filename]. ' +
   'Be concise and accurate.'
-
-// ── Supported extensions (mirrors Python pipeline) ───────────────────────────
 const SUPPORTED_EXTENSIONS = new Set([
   '.pdf', '.docx', '.doc', '.txt', '.rtf', '.odt',
   '.xlsx', '.xls', '.ods', '.csv', '.tsv',
@@ -51,8 +46,6 @@ const SUPPORTED_EXTENSIONS = new Set([
   '.r', '.sql', '.sh', '.bash', '.ps1',
   '.epub', '.eml',
 ])
-
-// ── MongoDB ──────────────────────────────────────────────────────────────────
 let db = null
 async function getDb() {
   if (db) return db
@@ -60,6 +53,15 @@ async function getDb() {
   await client.connect()
   db = client.db(MONGODB_DB)
   return db
+}
+let chatDb = null
+async function getChatDb() {
+  if (chatDb) return chatDb
+  const uri = CHAT_HISTORY_URI || MONGODB_URI
+  const client = new MongoClient(uri)
+  await client.connect()
+  chatDb = client.db(CHAT_HISTORY_DB)
+  return chatDb
 }
 
 // ── Auth middleware ───────────────────────────────────────────────────────────
@@ -78,11 +80,7 @@ function requireAdminKey(req, res, next) {
     return res.status(401).json({ error: 'Unauthorized' })
   next()
 }
-
-// ── Health ───────────────────────────────────────────────────────────────────
 app.get('/health', (req, res) => res.json({ ok: true, service: 'rag-client-auth' }))
-
-// ── Admin CRUD ────────────────────────────────────────────────────────────────
 app.post('/admin/clients', requireAdminKey, async (req, res) => {
   try {
     const { name, clientId, clientUsername, clientPassword } = req.body
@@ -206,11 +204,120 @@ async function verifyClientCreds(clientId, clientPassword) {
   if (!valid) return null
   return { clientId: client.clientId, name: client.name, clientUsername: client.clientUsername }
 }
+app.post('/chat/conversations', async (req, res) => {
+  try {
+    const { clientId, clientPassword, title } = req.body
+    if (!clientId || !clientPassword)
+      return res.status(400).json({ error: 'clientId and clientPassword are required' })
+    const client = await verifyClientCreds(clientId, clientPassword)
+    if (!client) return res.status(401).json({ error: 'Invalid credentials' })
 
-// ════════════════════════════════════════════════════════════════════════════
-//  TEXT EXTRACTION  — one handler per format group
-// ════════════════════════════════════════════════════════════════════════════
+    const database = await getChatDb()
+    const now = new Date()
+    const conversation = {
+      clientId: client.clientId,
+      title: title || 'New Conversation',
+      messages: [],
+      createdAt: now,
+      updatedAt: now,
+    }
+    const result = await database.collection('conversations').insertOne(conversation)
+    res.status(201).json({ ...conversation, _id: result.insertedId })
+  } catch (err) {
+    console.error('POST /chat/conversations:', err)
+    res.status(500).json({ error: err.message })
+  }
+})
+app.post('/chat/conversations/list', async (req, res) => {
+  try {
+    const { clientId, clientPassword } = req.body
+    if (!clientId || !clientPassword)
+      return res.status(400).json({ error: 'clientId and clientPassword are required' })
+    const client = await verifyClientCreds(clientId, clientPassword)
+    if (!client) return res.status(401).json({ error: 'Invalid credentials' })
 
+    const database = await getChatDb()
+    const conversations = await database.collection('conversations')
+      .find(
+        { clientId: client.clientId },
+        { projection: { messages: 0 } }
+      )
+      .sort({ updatedAt: -1 })
+      .toArray()
+
+    res.json({ conversations })
+  } catch (err) {
+    console.error('POST /chat/conversations/list:', err)
+    res.status(500).json({ error: err.message })
+  }
+})
+
+// Get a single conversation with all messages
+app.post('/chat/conversations/get', async (req, res) => {
+  try {
+    const { clientId, clientPassword, conversationId } = req.body
+    if (!clientId || !clientPassword || !conversationId)
+      return res.status(400).json({ error: 'clientId, clientPassword, conversationId are required' })
+    const client = await verifyClientCreds(clientId, clientPassword)
+    if (!client) return res.status(401).json({ error: 'Invalid credentials' })
+
+    const database = await getChatDb()
+    const conversation = await database.collection('conversations').findOne({
+      _id: new ObjectId(conversationId),
+      clientId: client.clientId,
+    })
+    if (!conversation) return res.status(404).json({ error: 'Conversation not found' })
+    res.json(conversation)
+  } catch (err) {
+    console.error('POST /chat/conversations/get:', err)
+    res.status(500).json({ error: err.message })
+  }
+})
+
+// Rename a conversation
+app.post('/chat/conversations/rename', async (req, res) => {
+  try {
+    const { clientId, clientPassword, conversationId, title } = req.body
+    if (!clientId || !clientPassword || !conversationId || !title)
+      return res.status(400).json({ error: 'clientId, clientPassword, conversationId, title are required' })
+    const client = await verifyClientCreds(clientId, clientPassword)
+    if (!client) return res.status(401).json({ error: 'Invalid credentials' })
+
+    const database = await getChatDb()
+    const result = await database.collection('conversations').findOneAndUpdate(
+      { _id: new ObjectId(conversationId), clientId: client.clientId },
+      { $set: { title: title.trim(), updatedAt: new Date() } },
+      { returnDocument: 'after', projection: { messages: 0 } }
+    )
+    if (!result) return res.status(404).json({ error: 'Conversation not found' })
+    res.json(result)
+  } catch (err) {
+    console.error('POST /chat/conversations/rename:', err)
+    res.status(500).json({ error: err.message })
+  }
+})
+
+// Delete a conversation
+app.post('/chat/conversations/delete', async (req, res) => {
+  try {
+    const { clientId, clientPassword, conversationId } = req.body
+    if (!clientId || !clientPassword || !conversationId)
+      return res.status(400).json({ error: 'clientId, clientPassword, conversationId are required' })
+    const client = await verifyClientCreds(clientId, clientPassword)
+    if (!client) return res.status(401).json({ error: 'Invalid credentials' })
+
+    const database = await getChatDb()
+    const result = await database.collection('conversations').deleteOne({
+      _id: new ObjectId(conversationId),
+      clientId: client.clientId,
+    })
+    if (result.deletedCount === 0) return res.status(404).json({ error: 'Conversation not found' })
+    res.json({ ok: true, deleted: conversationId })
+  } catch (err) {
+    console.error('POST /chat/conversations/delete:', err)
+    res.status(500).json({ error: err.message })
+  }
+})
 async function extractPdf(buffer) {
   const result = await pdfParse(buffer)
   return result.text || ''
@@ -221,24 +328,14 @@ async function extractWord(buffer) {
   return result.value || ''
 }
 
-// ── FIX: Row-aware spreadsheet extraction ────────────────────────────────────
-// OLD approach used sheet_to_csv which produced a flat TSV blob — the chunker
-// then sliced it every 500 chars, splitting measure names from their
-// descriptions. Now every row becomes a fully-labelled "Key: Value | Key: Value"
-// line so each chunk is self-contained and the LLM can always see which table,
-// measure name, description, and formula belong together.
 function extractSpreadsheet(buffer) {
   const workbook = XLSX.read(buffer, { type: 'buffer' })
   const parts = []
-
   for (const name of workbook.SheetNames) {
-    // sheet_to_json gives us [{colHeader: cellValue, ...}, ...] per row
     const rows = XLSX.utils.sheet_to_json(workbook.Sheets[name], { defval: '' })
     if (!rows.length) continue
     parts.push(`=== Sheet: ${name} ===`)
-
     for (const row of rows) {
-      // Serialise every non-empty cell as "ColumnName: Value"
       const line = Object.entries(row)
         .filter(([, v]) => String(v).trim() !== '')
         .map(([k, v]) => `${k}: ${String(v).replace(/\s+/g, ' ').trim()}`)
@@ -246,7 +343,6 @@ function extractSpreadsheet(buffer) {
       if (line.length > 10) parts.push(line)
     }
   }
-
   return parts.join('\n')
 }
 
@@ -314,120 +410,61 @@ async function extractEpub(buffer) {
   })
 }
 
-/** Master dispatcher — routes buffer to correct extractor by file extension */
 async function extractTextFromBuffer(buffer, fileName) {
   const ext = ('.' + fileName.split('.').pop()).toLowerCase()
-
-  // Documents
   if (ext === '.pdf')                          return extractPdf(buffer)
   if (ext === '.docx' || ext === '.doc')       return extractWord(buffer)
   if (ext === '.odt'  || ext === '.rtf')       return extractOffice(buffer)
-
-  // Spreadsheets
   if (['.xlsx', '.xls', '.ods'].includes(ext)) return extractSpreadsheet(buffer)
   if (ext === '.csv')                          return extractCsv(buffer, ',')
   if (ext === '.tsv')                          return extractCsv(buffer, '\t')
-
-  // Presentations
   if (ext === '.pptx' || ext === '.ppt')       return extractOffice(buffer)
-
-  // Web / Markup
   if (ext === '.html' || ext === '.htm')       return extractHtml(buffer)
   if (ext === '.xml')                          return extractXml(buffer)
   if (['.md', '.markdown', '.rst'].includes(ext)) return buffer.toString('utf-8')
-
-  // Data formats
   if (ext === '.json')                         return extractJson(buffer)
   if (ext === '.jsonl')                        return extractJsonl(buffer)
   if (ext === '.yaml' || ext === '.yml')       return extractYaml(buffer)
-  if (ext === '.toml')                         return buffer.toString('utf-8') // human-readable as-is
-
-  // All code files + .txt — plain UTF-8
+  if (ext === '.toml')                         return buffer.toString('utf-8')
   const plainText = new Set([
     '.txt', '.py', '.js', '.ts', '.jsx', '.tsx', '.java', '.cpp', '.c',
     '.h', '.cs', '.go', '.rb', '.php', '.swift', '.kt', '.r', '.sql',
     '.sh', '.bash', '.ps1',
   ])
   if (plainText.has(ext))                      return buffer.toString('utf-8')
-
-  // eBook / Email
   if (ext === '.epub')                         return extractEpub(buffer)
   if (ext === '.eml')                          return extractEml(buffer)
-
   console.warn(`[extractText] Unsupported extension: ${ext} (${fileName})`)
   return ''
 }
-
-// ════════════════════════════════════════════════════════════════════════════
-//  CHUNKING
-// ════════════════════════════════════════════════════════════════════════════
-
-// ── FIX: Line-aware chunking ─────────────────────────────────────────────────
-// OLD approach sliced raw text every 500 characters, blindly cutting through
-// row entries so a measure's name ended up in one chunk and its description
-// in the next. The LLM then saw neither as a complete definition.
-//
-// NEW approach:
-//  • Splits on newlines, never inside a line.
-//  • Accumulates lines until adding the next line would exceed CHUNK_SIZE.
-//  • Carries the last CHUNK_OVERLAP lines into the next chunk so cross-chunk
-//    context (e.g. a sheet header line) is not lost entirely.
-//  • For spreadsheet data this means each chunk contains only whole
-//    "Table: X | Measure: Y | Description: Z" records — fully answerable
-//    by the LLM without needing to stitch adjacent chunks together.
 function chunkText(text, sourceFile) {
   const chunks = []
   let index = 0
-
-  // Normalise line endings and collapse runs of blank lines
   const lines = text
     .replace(/\r\n/g, '\n')
     .split('\n')
     .map(l => l.trim())
     .filter(l => l.length > 0)
-
-  let buffer = []   // array of lines currently accumulated
-
+  let buffer = []
   for (const line of lines) {
     const projectedLength = buffer.join('\n').length + (buffer.length ? 1 : 0) + line.length
-
     if (buffer.length > 0 && projectedLength > CHUNK_SIZE) {
-      // Flush current buffer as a chunk
       const chunkText = buffer.join('\n')
       if (chunkText.length > 30) {
-        chunks.push({
-          text: chunkText,
-          source_file: sourceFile,
-          chunk_index: index++,
-          embedding: [],
-        })
+        chunks.push({ text: chunkText, source_file: sourceFile, chunk_index: index++, embedding: [] })
       }
-      // Carry the last CHUNK_OVERLAP lines into the next chunk for context
       buffer = buffer.slice(-CHUNK_OVERLAP)
     }
-
     buffer.push(line)
   }
-
-  // Flush any remaining lines
   if (buffer.length > 0) {
     const chunkText = buffer.join('\n')
     if (chunkText.length > 30) {
-      chunks.push({
-        text: chunkText,
-        source_file: sourceFile,
-        chunk_index: index++,
-        embedding: [],
-      })
+      chunks.push({ text: chunkText, source_file: sourceFile, chunk_index: index++, embedding: [] })
     }
   }
-
   return chunks
 }
-
-// ════════════════════════════════════════════════════════════════════════════
-//  AZURE BLOB — load all supported files from raw/{clientId}/
-// ════════════════════════════════════════════════════════════════════════════
 async function downloadBlobAsBuffer(containerClient, blobName) {
   const download = await containerClient.getBlobClient(blobName).download()
   const parts = []
@@ -441,21 +478,16 @@ async function loadChunksForClient(clientId) {
   const containerClient = BlobServiceClient
     .fromConnectionString(AZURE_CONNECTION_STRING)
     .getContainerClient(AZURE_CONTAINER_NAME)
-
   const prefix = `${RAW_PREFIX}/${clientId}/`
   console.log(`[loadChunks] Scanning: "${prefix}"`)
-
   const allChunks = []
-
   for await (const blob of containerClient.listBlobsFlat({ prefix })) {
     const fileName = blob.name.split('/').pop()
     const ext      = ('.' + fileName.split('.').pop()).toLowerCase()
-
     if (!SUPPORTED_EXTENSIONS.has(ext)) {
       console.log(`[loadChunks] Skipping unsupported: ${fileName}`)
       continue
     }
-
     console.log(`[loadChunks] Processing: ${fileName}`)
     try {
       const buffer = await downloadBlobAsBuffer(containerClient, blob.name)
@@ -468,14 +500,9 @@ async function loadChunksForClient(clientId) {
       console.warn(`[loadChunks] Failed ${fileName}:`, err.message)
     }
   }
-
   console.log(`[loadChunks] Total: ${allChunks.length} chunks for "${clientId}"`)
   return allChunks
 }
-
-// ════════════════════════════════════════════════════════════════════════════
-//  RETRIEVAL
-// ════════════════════════════════════════════════════════════════════════════
 function cosineSim(a, b) {
   let dot = 0, normA = 0, normB = 0
   for (let i = 0; i < a.length; i++) {
@@ -483,7 +510,6 @@ function cosineSim(a, b) {
   }
   return dot / (Math.sqrt(normA) * Math.sqrt(normB) + 1e-9)
 }
-
 function keywordSearch(query, chunks, topK) {
   const words = query.toLowerCase().split(/\s+/).filter(Boolean)
   return chunks
@@ -500,11 +526,8 @@ async function embedQueryGemini(query) {
 }
 
 async function retrieveChunks(query, chunks, topK = 5) {
-  // Keyword pre-filter → top 50 candidates
   const candidates = keywordSearch(query, chunks, Math.min(50, chunks.length))
   const pool       = candidates.length > 0 ? candidates : chunks.slice(0, 50)
-
-  // Semantic re-ranking with Gemini
   if (GEMINI_API_KEY) {
     try {
       const queryVec = await embedQueryGemini(query)
@@ -539,10 +562,10 @@ async function answerWithGemini(query, context) {
   })
   return res.text
 }
-
-// ════════════════════════════════════════════════════════════════════════════
-//  CHAT ENDPOINTS
-// ════════════════════════════════════════════════════════════════════════════
+function generateTitle(query) {
+  const cleaned = query.trim().replace(/[?!.]+$/, '')
+  return cleaned.length > 50 ? cleaned.slice(0, 50) + '…' : cleaned
+}
 app.post('/chat/login', async (req, res) => {
   try {
     const { clientId, clientPassword } = req.body
@@ -556,7 +579,7 @@ app.post('/chat/login', async (req, res) => {
 
 app.post('/chat/message', async (req, res) => {
   try {
-    const { clientId, clientPassword, query, topK = 5 } = req.body
+    const { clientId, clientPassword, query, topK = 5, conversationId } = req.body
     if (!clientId || !clientPassword)
       return res.status(400).json({ error: 'clientId and clientPassword are required' })
     if (!query?.trim())
@@ -572,7 +595,6 @@ app.post('/chat/message', async (req, res) => {
     const hits = await retrieveChunks(query.trim(), chunks, Math.min(topK, 15))
     if (hits.length === 0)
       return res.json({ answer: 'No relevant content found in your documents for that question.', sources: [], client })
-
     const answer  = await answerWithGemini(query.trim(), buildContext(hits))
     const sources = hits.map(h => ({
       source_file: h.source_file || 'unknown',
@@ -580,10 +602,47 @@ app.post('/chat/message', async (req, res) => {
       score:   typeof h._score === 'number' ? parseFloat(h._score.toFixed(4)) : null,
       preview: (h.text || '').slice(0, 300),
     }))
-    res.json({ answer, sources, client })
+    try {
+      const chatDatabase = await getChatDb()
+      const col = chatDatabase.collection('conversations')
+      const now = new Date()
+      const userMsg = { role: 'user', content: query.trim(), timestamp: now }
+      const assistantMsg = {
+        role: 'assistant', content: answer,
+        sources: sources.map(s => ({ source_file: s.source_file, score: s.score })),
+        timestamp: now,
+      }
+
+      if (conversationId) {
+        // Append to existing conversation
+        await col.updateOne(
+          { _id: new ObjectId(conversationId), clientId: client.clientId },
+          {
+            $push: { messages: { $each: [userMsg, assistantMsg] } },
+            $set: { updatedAt: now },
+          }
+        )
+        res.json({ answer, sources, client, conversationId })
+      } else {
+        // Create new conversation with auto-title from first message
+        const title = generateTitle(query.trim())
+        const result = await col.insertOne({
+          clientId: client.clientId,
+          title,
+          messages: [userMsg, assistantMsg],
+          createdAt: now,
+          updatedAt: now,
+        })
+        res.json({ answer, sources, client, conversationId: result.insertedId.toString() })
+      }
+    } catch (histErr) {
+      console.warn('[chat/message] History save failed (non-fatal):', histErr.message)
+      // Still return answer even if history save fails
+      res.json({ answer, sources, client, conversationId: conversationId || null })
+    }
+
   } catch (err) { console.error('POST /chat/message:', err); res.status(500).json({ error: err.message }) }
 })
-
 const PORT = process.env.PORT || 4000
 app.listen(PORT, () => console.log(`rag-client-auth running on port ${PORT}`))
 module.exports = app
