@@ -106,16 +106,8 @@ async function getChatDb() {
   chatDb = client.db(CHAT_HISTORY_DB)
   return chatDb
 }
-
-// ════════════════════════════════════════════════════════════════════════════
-//  AUTH LAYER  (only section changed vs old backend)
-//  Before: JWT + bcrypt (clientUsername / clientPassword)
-//  After:  rak_ API key stored plain in MongoDB, sent as Authorization: Bearer
-// ════════════════════════════════════════════════════════════════════════════
-
-// In-memory cache — avoids a DB round-trip on every chat message
 const CLIENT_CACHE = new Map()
-const CACHE_TTL_MS = 5 * 60 * 1000   // 5 minutes
+const CACHE_TTL_MS = 5 * 60 * 1000  
 
 function getCached(apiKey) {
   const entry = CLIENT_CACHE.get(apiKey)
@@ -163,14 +155,7 @@ function requireAdminKey(req, res, next) {
     return res.status(401).json({ error: 'Unauthorized' })
   next()
 }
-
-// ── Health ─────────────────────────────────────────────────────────────────────
 app.get('/health', (req, res) => res.json({ ok: true, service: 'rag-client-auth' }))
-
-// ════════════════════════════════════════════════════════════════════════════
-//  ADMIN CRUD
-//  Changed: stores apiKey instead of clientUsername + bcrypt(clientPassword)
-// ════════════════════════════════════════════════════════════════════════════
 
 app.post('/admin/clients', requireAdminKey, async (req, res) => {
   try {
@@ -190,16 +175,16 @@ app.post('/admin/clients', requireAdminKey, async (req, res) => {
 
     const now = new Date().toISOString()
     const doc = {
-      name:            name.trim(),
-      clientId:        clientId.trim().toLowerCase(),
-      apiKey,                             // stored plain — it IS the credential
+      name: name.trim(),
+      clientId: clientId.trim().toLowerCase(),
+      apiKey,                            
       apiKeyRotatedAt: now,
       folderLink: '', sourceType: 'google-drive', status: 'idle',
       documentsCount: 0, autoSync: false, watchIntervalMs: 300000,
       lastRunAt: null, lastError: null, createdAt: now, updatedAt: now,
     }
     const result = await col.insertOne(doc)
-    res.status(201).json({ ...doc, _id: result.insertedId })  // apiKey shown only on create
+    res.status(201).json({ ...doc, _id: result.insertedId })  
   } catch (err) {
     console.error('POST /admin/clients:', err)
     res.status(500).json({ error: err.message })
@@ -210,7 +195,7 @@ app.get('/admin/clients', requireAdminKey, async (req, res) => {
   try {
     const database = await getDb()
     const clients  = await database.collection('clients')
-      .find({}, { projection: { apiKey: 0 } })   // never expose key in listings
+      .find({}, { projection: { apiKey: 0 } })  
       .sort({ createdAt: -1 }).toArray()
     res.json({ clients })
   } catch (err) { res.status(500).json({ error: err.message }) }
@@ -288,9 +273,6 @@ app.delete('/admin/clients/:clientId', requireAdminKey, async (req, res) => {
     res.status(500).json({ error: err.message })
   }
 })
-
-// ── Client auth endpoints ──────────────────────────────────────────────────────
-// Replaced JWT login with simple API key validation — no token issued.
 app.post('/client/login', async (req, res) => {
   try {
     const apiKey = req.body.apiKey || extractApiKey(req)
@@ -314,13 +296,6 @@ app.get('/client/me', requireClientKey, async (req, res) => {
     res.json(client)
   } catch (err) { res.status(500).json({ error: err.message }) }
 })
-
-// ════════════════════════════════════════════════════════════════════════════
-//  CHAT HISTORY ENDPOINTS
-//  Changed: removed clientId+clientPassword from request body entirely.
-//  Identity now comes from requireClientKey middleware via Authorization header.
-// ════════════════════════════════════════════════════════════════════════════
-
 app.post('/chat/conversations', requireClientKey, async (req, res) => {
   try {
     const { title }  = req.body
@@ -409,10 +384,6 @@ app.post('/chat/conversations/delete', requireClientKey, async (req, res) => {
     res.status(500).json({ error: err.message })
   }
 })
-
-// ════════════════════════════════════════════════════════════════════════════
-//  TEXT EXTRACTION — untouched
-// ════════════════════════════════════════════════════════════════════════════
 
 async function extractPdf(buffer) {
   const result = await pdfParse(buffer)
@@ -580,11 +551,6 @@ async function extractTextFromBuffer(buffer, fileName) {
   console.warn(`[extractText] Unsupported extension: ${ext} (${fileName})`)
   return ''
 }
-
-// ════════════════════════════════════════════════════════════════════════════
-//  CHUNKING — untouched
-// ════════════════════════════════════════════════════════════════════════════
-
 function chunkText(text, sourceFile) {
   const chunks = []
   let index = 0
@@ -786,8 +752,6 @@ app.post('/chat/login', async (req, res) => {
   }
 })
 
-// Auth changed: no clientId+clientPassword in body — identity from middleware.
-// RAG logic, history saving, response shape: all identical to old backend.
 app.post('/chat/message', requireClientKey, async (req, res) => {
   try {
     const { query, topK = 6, conversationId } = req.body
