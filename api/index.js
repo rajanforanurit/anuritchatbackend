@@ -12,58 +12,41 @@ const yaml = require('js-yaml')
 const Papa = require('papaparse')
 const { simpleParser } = require('mailparser')
 const { parseOffice } = require('officeparser')
-
 const app = express()
 app.use(cors())
 app.use(express.json())
-
-// ── Config ────────────────────────────────────────────────────────────────────
 const MONGODB_URI = process.env.MONGODB_URI
 const MONGODB_DB  = process.env.MONGODB_DB || 'clientcreds'
 const CHAT_HISTORY_URI = process.env.CHAT_HISTORY_URI
-const CHAT_HISTORY_DB = process.env.CHAT_HISTORY_DB || 'chathistory'
+const CHAT_HISTORY_DB  = process.env.CHAT_HISTORY_DB || 'chathistory'
 const AZURE_CONNECTION_STRING = process.env.AZURE_CONNECTION_STRING || ''
 const AZURE_CONTAINER_NAME = process.env.AZURE_CONTAINER_NAME || 'vectordbforrag'
-const GEMINI_API_KEY = process.env.GEMINI_API_KEY  || ''
-
+const GEMINI_API_KEY  = process.env.GEMINI_API_KEY || ''
 const RAW_PREFIX    = 'raw'
 const CHUNK_SIZE    = 500
 const CHUNK_OVERLAP = 2
+const SYSTEM_PROMPT = `You are a helpful business document assistant. Your job is to answer questions based on document content provided to you.
 
-// ── FIX 1: Completely rewritten system prompt ─────────────────────────────────
-// The old prompt had rule #6 that was too aggressive — it told the model to say
-// "I couldn't find..." as an exact string even when context DID contain the term.
-// The model was confused because GL Activity appears as a Field4 *value*, not a
-// labeled definition. The new prompt explicitly handles this pattern.
-const SYSTEM_PROMPT = `
-You are a helpful business document assistant. Your job is to answer questions using the document context provided below.
+CRITICAL READING INSTRUCTIONS — read these carefully before answering:
 
-CRITICAL INSTRUCTIONS — read carefully before answering:
+1. SPREADSHEET DATA: The context may contain data extracted from Excel or spreadsheet files. This data appears as rows of key-value pairs like:
+   "Field1: GL Activity | Field2: General Ledger | Field3: Used for tracking"
+   Each row represents one record. Terms appearing as VALUES in these rows are real data — treat them as defined, named items in the document.
 
-1. The context may include spreadsheet rows formatted like:
-   "ColumnA: Value1 | ColumnB: Value2 | ColumnC: Value3"
-   or
-   "Value1 is described as: ColumnB: Value2, ColumnC: Value3"
-   Treat EVERY value in these rows as real data, regardless of which column it appears in.
+2. DO NOT require a formal "definition" to exist. If a term like "GL Activity" appears anywhere in the context — as a column value, a row label, a list item, or inline text — it IS present in the documents. Describe what the context shows about it.
 
-2. A term like "GL Activity" may appear as a Field value (e.g., "Field4: GL Activity") — this means GL Activity IS a recognized term/category in the dataset. Use surrounding row data to explain it.
+3. INTERPRET ROWS INTELLIGENTLY: If you see a row like "Category: GL Activity | Description: General Ledger transaction type | Code: GLA" — that row IS the definition. Read it and explain it conversationally.
 
-3. Search case-insensitively. "gl activity", "GL Activity", "GL ACTIVITY" are the same.
+4. CASE INSENSITIVE: Treat "gl activity", "GL Activity", "GL ACTIVITY" as the same thing.
 
-4. Check all columns — not just named/header columns. If the term appears ANYWHERE in the context (as a key OR as a value), it is present.
+5. NEVER say "the context does not define", "not mentioned in the context", "the provided context does not contain", or similar refusals — these are forbidden responses if the term appears ANYWHERE in the context data. Search carefully before concluding something is absent.
 
-5. Check abbreviations and partial matches: "GL" = "General Ledger", "GL Activity" could relate to General Ledger transactions.
+6. If after genuinely searching the entire context the term truly does not appear in any form, respond with: "I couldn't find specific information about that in your documents."
 
-6. When you find the term, explain it naturally in plain English based on what the surrounding context says about it. Do NOT quote raw field names like "Field2" or "Field3" in your response.
-
-7. Only if the term is genuinely absent from the entire context after a thorough search, say:
-   "I couldn't find specific information about that in your documents."
-   Do NOT say this if the term appears anywhere in the context, even as a field value.
-
-8. Do not mention file names, chunk numbers, sources, or citations in your answer.
-9. Do not use [1], [2], [3] style references.
-10. Be concise, professional, and natural. Answer only what was asked.
-`;
+7. Do NOT add [1], [2], [3] or any citation numbers in your response.
+8. Do NOT mention file names or source documents in your answer.
+9. Write like a knowledgeable human colleague — clear, direct, conversational. No robotic phrasing.
+10. Answer only what was asked. Be concise.`
 
 const SUPPORTED_EXTENSIONS = new Set([
   '.pdf', '.docx', '.doc', '.txt', '.rtf', '.odt',
@@ -78,18 +61,20 @@ const SUPPORTED_EXTENSIONS = new Set([
   '.epub', '.eml',
 ])
 
-let db     = null
-let chatDb = null
-
+// ── MongoDB (main) ─────────────────────────────────────────────────────────────
+let db = null
 async function getDb() {
   if (db) return db
   const client = new MongoClient(MONGODB_URI)
   await client.connect()
   db = client.db(MONGODB_DB)
+  // Unique index on apiKey for fast O(1) lookups
   await db.collection('clients').createIndex({ apiKey: 1 }, { unique: true, sparse: true })
   return db
 }
 
+// ── MongoDB (chat history) ─────────────────────────────────────────────────────
+let chatDb = null
 async function getChatDb() {
   if (chatDb) return chatDb
   const uri    = CHAT_HISTORY_URI || MONGODB_URI
@@ -99,9 +84,15 @@ async function getChatDb() {
   return chatDb
 }
 
-// ── In-memory client cache ────────────────────────────────────────────────────
+// ════════════════════════════════════════════════════════════════════════════
+//  AUTH LAYER  (only section changed vs old backend)
+//  Before: JWT + bcrypt (clientUsername / clientPassword)
+//  After:  rak_ API key stored plain in MongoDB, sent as Authorization: Bearer
+// ════════════════════════════════════════════════════════════════════════════
+
+// In-memory cache — avoids a DB round-trip on every chat message
 const CLIENT_CACHE = new Map()
-const CACHE_TTL_MS = 5 * 60 * 1000
+const CACHE_TTL_MS = 5 * 60 * 1000   // 5 minutes
 
 function getCached(apiKey) {
   const entry = CLIENT_CACHE.get(apiKey)
@@ -109,9 +100,10 @@ function getCached(apiKey) {
   if (Date.now() - entry.cachedAt > CACHE_TTL_MS) { CLIENT_CACHE.delete(apiKey); return null }
   return entry
 }
-function setCache(apiKey, clientData) { CLIENT_CACHE.set(apiKey, { ...clientData, cachedAt: Date.now() }) }
+function setCache(apiKey, data) { CLIENT_CACHE.set(apiKey, { ...data, cachedAt: Date.now() }) }
 function evictCache(apiKey) { if (apiKey) CLIENT_CACHE.delete(apiKey) }
 
+// Validates a rak_ API key → returns { clientId, name } or null
 async function verifyApiKey(apiKey) {
   if (!apiKey || !apiKey.startsWith('rak_')) return null
   const cached = getCached(apiKey)
@@ -125,31 +117,36 @@ async function verifyApiKey(apiKey) {
   return { clientId: client.clientId, name: client.name }
 }
 
+// Extract key from "Authorization: Bearer rak_..."
 function extractApiKey(req) {
   const header = req.headers['authorization'] || ''
   return header.startsWith('Bearer ') ? header.slice(7).trim() : null
 }
 
+// Middleware for all client-facing routes
 async function requireClientKey(req, res, next) {
   const apiKey = extractApiKey(req)
   if (!apiKey) return res.status(401).json({ error: 'Missing API key' })
   const client = await verifyApiKey(apiKey)
   if (!client) return res.status(401).json({ error: 'Invalid or expired API key' })
-  req.client = client
+  req.client = client   // { clientId, name }
   next()
 }
 
+// Middleware for admin routes — unchanged logic, just renamed for clarity
 function requireAdminKey(req, res, next) {
   const key = extractApiKey(req)
-  if (!key || key !== process.env.ADMIN_API_KEY) return res.status(401).json({ error: 'Unauthorized' })
+  if (!key || key !== process.env.ADMIN_API_KEY)
+    return res.status(401).json({ error: 'Unauthorized' })
   next()
 }
 
 // ── Health ─────────────────────────────────────────────────────────────────────
-app.get('/health', (_req, res) => res.json({ ok: true, service: 'rag-client-auth' }))
+app.get('/health', (req, res) => res.json({ ok: true, service: 'rag-client-auth' }))
 
 // ════════════════════════════════════════════════════════════════════════════
 //  ADMIN CRUD
+//  Changed: stores apiKey instead of clientUsername + bcrypt(clientPassword)
 // ════════════════════════════════════════════════════════════════════════════
 
 app.post('/admin/clients', requireAdminKey, async (req, res) => {
@@ -170,21 +167,28 @@ app.post('/admin/clients', requireAdminKey, async (req, res) => {
 
     const now = new Date().toISOString()
     const doc = {
-      name: name.trim(), clientId: clientId.trim().toLowerCase(), apiKey,
-      apiKeyRotatedAt: now, folderLink: '', sourceType: 'google-drive',
-      status: 'idle', documentsCount: 0, autoSync: false, watchIntervalMs: 300000,
+      name:            name.trim(),
+      clientId:        clientId.trim().toLowerCase(),
+      apiKey,                             // stored plain — it IS the credential
+      apiKeyRotatedAt: now,
+      folderLink: '', sourceType: 'google-drive', status: 'idle',
+      documentsCount: 0, autoSync: false, watchIntervalMs: 300000,
       lastRunAt: null, lastError: null, createdAt: now, updatedAt: now,
     }
     const result = await col.insertOne(doc)
-    res.status(201).json({ ...doc, _id: result.insertedId })
-  } catch (err) { console.error('POST /admin/clients:', err); res.status(500).json({ error: err.message }) }
+    res.status(201).json({ ...doc, _id: result.insertedId })  // apiKey shown only on create
+  } catch (err) {
+    console.error('POST /admin/clients:', err)
+    res.status(500).json({ error: err.message })
+  }
 })
 
 app.get('/admin/clients', requireAdminKey, async (req, res) => {
   try {
     const database = await getDb()
     const clients  = await database.collection('clients')
-      .find({}, { projection: { apiKey: 0 } }).sort({ createdAt: -1 }).toArray()
+      .find({}, { projection: { apiKey: 0 } })   // never expose key in listings
+      .sort({ createdAt: -1 }).toArray()
     res.json({ clients })
   } catch (err) { res.status(500).json({ error: err.message }) }
 })
@@ -204,15 +208,18 @@ app.patch('/admin/clients/:clientId', requireAdminKey, async (req, res) => {
   try {
     const database = await getDb()
     const updates  = { ...req.body, updatedAt: new Date().toISOString() }
+
     if (updates.apiKey !== undefined) {
       if (!updates.apiKey.startsWith('rak_'))
         return res.status(400).json({ error: 'apiKey must start with "rak_"' })
+      // Evict old key from cache so it stops working immediately
       const old = await database.collection('clients').findOne(
         { clientId: req.params.clientId }, { projection: { apiKey: 1 } }
       )
       if (old?.apiKey) evictCache(old.apiKey)
       updates.apiKeyRotatedAt = new Date().toISOString()
     }
+
     const result = await database.collection('clients').findOneAndUpdate(
       { clientId: req.params.clientId },
       { $set: updates },
@@ -229,6 +236,7 @@ app.delete('/admin/clients/:clientId', requireAdminKey, async (req, res) => {
     const database     = await getDb()
     const client       = await database.collection('clients').findOne({ clientId })
     if (!client) return res.status(404).json({ error: 'Client not found' })
+
     if (client.apiKey) evictCache(client.apiKey)
     await database.collection('clients').deleteOne({ clientId })
 
@@ -250,15 +258,16 @@ app.delete('/admin/clients/:clientId', requireAdminKey, async (req, res) => {
     res.json({
       ok: true, deleted: clientId,
       blobsDeleted: blobsDeleted.length,
-      blobsFailed: blobsFailed.length > 0 ? blobsFailed : undefined,
+      blobsFailed:  blobsFailed.length > 0 ? blobsFailed : undefined,
     })
-  } catch (err) { console.error('DELETE /admin/clients:', err); res.status(500).json({ error: err.message }) }
+  } catch (err) {
+    console.error('DELETE /admin/clients:', err)
+    res.status(500).json({ error: err.message })
+  }
 })
 
-// ════════════════════════════════════════════════════════════════════════════
-//  CLIENT AUTH
-// ════════════════════════════════════════════════════════════════════════════
-
+// ── Client auth endpoints ──────────────────────────────────────────────────────
+// Replaced JWT login with simple API key validation — no token issued.
 app.post('/client/login', async (req, res) => {
   try {
     const apiKey = req.body.apiKey || extractApiKey(req)
@@ -266,7 +275,10 @@ app.post('/client/login', async (req, res) => {
     const client = await verifyApiKey(apiKey)
     if (!client) return res.status(401).json({ error: 'Invalid API key' })
     res.json({ ok: true, client })
-  } catch (err) { console.error('POST /client/login:', err); res.status(500).json({ error: err.message }) }
+  } catch (err) {
+    console.error('POST /client/login:', err)
+    res.status(500).json({ error: err.message })
+  }
 })
 
 app.get('/client/me', requireClientKey, async (req, res) => {
@@ -281,21 +293,29 @@ app.get('/client/me', requireClientKey, async (req, res) => {
 })
 
 // ════════════════════════════════════════════════════════════════════════════
-//  CHAT HISTORY
+//  CHAT HISTORY ENDPOINTS
+//  Changed: removed clientId+clientPassword from request body entirely.
+//  Identity now comes from requireClientKey middleware via Authorization header.
 // ════════════════════════════════════════════════════════════════════════════
 
 app.post('/chat/conversations', requireClientKey, async (req, res) => {
   try {
-    const { title } = req.body
-    const database  = await getChatDb()
-    const now       = new Date()
+    const { title }  = req.body
+    const database   = await getChatDb()
+    const now        = new Date()
     const conversation = {
-      clientId: req.client.clientId, title: title || 'New Conversation',
-      messages: [], createdAt: now, updatedAt: now,
+      clientId:  req.client.clientId,
+      title:     title || 'New Conversation',
+      messages:  [],
+      createdAt: now,
+      updatedAt: now,
     }
     const result = await database.collection('conversations').insertOne(conversation)
     res.status(201).json({ ...conversation, _id: result.insertedId })
-  } catch (err) { console.error('POST /chat/conversations:', err); res.status(500).json({ error: err.message }) }
+  } catch (err) {
+    console.error('POST /chat/conversations:', err)
+    res.status(500).json({ error: err.message })
+  }
 })
 
 app.post('/chat/conversations/list', requireClientKey, async (req, res) => {
@@ -303,28 +323,38 @@ app.post('/chat/conversations/list', requireClientKey, async (req, res) => {
     const database      = await getChatDb()
     const conversations = await database.collection('conversations')
       .find({ clientId: req.client.clientId }, { projection: { messages: 0 } })
-      .sort({ updatedAt: -1 }).toArray()
+      .sort({ updatedAt: -1 })
+      .toArray()
     res.json({ conversations })
-  } catch (err) { console.error('POST /chat/conversations/list:', err); res.status(500).json({ error: err.message }) }
+  } catch (err) {
+    console.error('POST /chat/conversations/list:', err)
+    res.status(500).json({ error: err.message })
+  }
 })
 
 app.post('/chat/conversations/get', requireClientKey, async (req, res) => {
   try {
     const { conversationId } = req.body
-    if (!conversationId) return res.status(400).json({ error: 'conversationId is required' })
+    if (!conversationId)
+      return res.status(400).json({ error: 'conversationId is required' })
     const database     = await getChatDb()
     const conversation = await database.collection('conversations').findOne({
-      _id: new ObjectId(conversationId), clientId: req.client.clientId,
+      _id:      new ObjectId(conversationId),
+      clientId: req.client.clientId,
     })
     if (!conversation) return res.status(404).json({ error: 'Conversation not found' })
     res.json(conversation)
-  } catch (err) { console.error('POST /chat/conversations/get:', err); res.status(500).json({ error: err.message }) }
+  } catch (err) {
+    console.error('POST /chat/conversations/get:', err)
+    res.status(500).json({ error: err.message })
+  }
 })
 
 app.post('/chat/conversations/rename', requireClientKey, async (req, res) => {
   try {
     const { conversationId, title } = req.body
-    if (!conversationId || !title) return res.status(400).json({ error: 'conversationId and title are required' })
+    if (!conversationId || !title)
+      return res.status(400).json({ error: 'conversationId and title are required' })
     const database = await getChatDb()
     const result   = await database.collection('conversations').findOneAndUpdate(
       { _id: new ObjectId(conversationId), clientId: req.client.clientId },
@@ -333,39 +363,50 @@ app.post('/chat/conversations/rename', requireClientKey, async (req, res) => {
     )
     if (!result) return res.status(404).json({ error: 'Conversation not found' })
     res.json(result)
-  } catch (err) { console.error('POST /chat/conversations/rename:', err); res.status(500).json({ error: err.message }) }
+  } catch (err) {
+    console.error('POST /chat/conversations/rename:', err)
+    res.status(500).json({ error: err.message })
+  }
 })
 
 app.post('/chat/conversations/delete', requireClientKey, async (req, res) => {
   try {
     const { conversationId } = req.body
-    if (!conversationId) return res.status(400).json({ error: 'conversationId is required' })
+    if (!conversationId)
+      return res.status(400).json({ error: 'conversationId is required' })
     const database = await getChatDb()
     const result   = await database.collection('conversations').deleteOne({
-      _id: new ObjectId(conversationId), clientId: req.client.clientId,
+      _id:      new ObjectId(conversationId),
+      clientId: req.client.clientId,
     })
     if (result.deletedCount === 0) return res.status(404).json({ error: 'Conversation not found' })
     res.json({ ok: true, deleted: conversationId })
-  } catch (err) { console.error('POST /chat/conversations/delete:', err); res.status(500).json({ error: err.message }) }
+  } catch (err) {
+    console.error('POST /chat/conversations/delete:', err)
+    res.status(500).json({ error: err.message })
+  }
 })
 
 // ════════════════════════════════════════════════════════════════════════════
-//  TEXT EXTRACTION
+//  TEXT EXTRACTION — untouched
 // ════════════════════════════════════════════════════════════════════════════
 
 async function extractPdf(buffer) {
-  const result = await pdfParse(buffer); return result.text || ''
+  const result = await pdfParse(buffer)
+  return result.text || ''
 }
+
 async function extractWord(buffer) {
-  const result = await mammoth.extractRawText({ buffer }); return result.value || ''
+  const result = await mammoth.extractRawText({ buffer })
+  return result.value || ''
 }
 
 function extractSpreadsheet(buffer) {
   const workbook = XLSX.read(buffer, { type: 'buffer' })
-  const parts    = []
+  const parts = []
 
   for (const sheetName of workbook.SheetNames) {
-    const sheet   = workbook.Sheets[sheetName]
+    const sheet = workbook.Sheets[sheetName]
     const rawRows = XLSX.utils.sheet_to_json(sheet, { defval: '', header: 1 })
     if (!rawRows.length) continue
 
@@ -373,7 +414,10 @@ function extractSpreadsheet(buffer) {
 
     let headerRowIdx = 0
     for (let i = 0; i < Math.min(10, rawRows.length); i++) {
-      if (rawRows[i].some(cell => String(cell).trim() !== '')) { headerRowIdx = i; break }
+      if (rawRows[i].some(cell => String(cell).trim() !== '')) {
+        headerRowIdx = i
+        break
+      }
     }
 
     const headers = rawRows[headerRowIdx].map(h => String(h).trim())
@@ -381,7 +425,10 @@ function extractSpreadsheet(buffer) {
     for (let i = headerRowIdx + 1; i < rawRows.length; i++) {
       const row = rawRows[i]
       if (!row.some(cell => String(cell).trim() !== '')) continue
-      const pairs = [], values = []
+
+      const pairs = []
+      const values = []
+
       for (let j = 0; j < Math.max(headers.length, row.length); j++) {
         const val = String(row[j] || '').trim()
         if (!val) continue
@@ -389,20 +436,13 @@ function extractSpreadsheet(buffer) {
         pairs.push(`${key}: ${val}`)
         values.push(val)
       }
+
       if (pairs.length > 0) {
-        // FIX 2: Emit the full row AND explicit "X is a type of Y" sentences
-        // so the LLM can match field values like "GL Activity" directly
         parts.push(pairs.join(' | '))
         if (values.length >= 2) {
-          parts.push(`${values[0]} is described as: ${pairs.slice(1).join(', ')}`)
-        }
-        // FIX 3: Also emit each value as a standalone searchable term with context
-        // This ensures "GL Activity" as a Field4 value gets its own indexed line
-        for (let j = 0; j < values.length; j++) {
-          const otherPairs = pairs.filter((_, k) => k !== j)
-          if (otherPairs.length > 0) {
-            parts.push(`"${values[j]}" appears in: ${otherPairs.join(' | ')}`)
-          }
+          const subject = values[0]
+          const rest = pairs.slice(1).join(', ')
+          parts.push(`${subject} is described as: ${rest}`)
         }
       }
     }
@@ -410,14 +450,15 @@ function extractSpreadsheet(buffer) {
     parts.push('')
     parts.push('[All values in this sheet:]')
     for (let i = headerRowIdx + 1; i < rawRows.length; i++) {
-      const row      = rawRows[i]
+      const row = rawRows[i]
       const rowValues = row
         .map((cell, j) => {
           const val = String(cell || '').trim()
           if (!val) return ''
           const key = headers[j] && headers[j] !== '' ? headers[j] : `Field${j + 1}`
           return `${val} (${key})`
-        }).filter(Boolean)
+        })
+        .filter(Boolean)
       if (rowValues.length) parts.push(rowValues.join(', '))
     }
   }
@@ -437,7 +478,8 @@ function extractCsv(buffer, delimiter = ',') {
 async function extractOffice(buffer) {
   return new Promise((resolve, reject) => {
     parseOffice(buffer, (text, err) => {
-      if (err) reject(err); else resolve(text || '')
+      if (err) reject(err)
+      else resolve(text || '')
     }, { outputErrorToConsole: false })
   })
 }
@@ -447,22 +489,27 @@ function extractHtml(buffer) {
   root.querySelectorAll('script, style').forEach(n => n.remove())
   return root.structuredText || root.innerText || root.rawText || ''
 }
+
 function extractXml(buffer) {
   return buffer.toString('utf-8').replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim()
 }
+
 function extractJson(buffer) {
   try { return JSON.stringify(JSON.parse(buffer.toString('utf-8')), null, 2) }
   catch { return buffer.toString('utf-8') }
 }
+
 function extractJsonl(buffer) {
   return buffer.toString('utf-8').split('\n').filter(Boolean)
     .map(line => { try { return JSON.stringify(JSON.parse(line)) } catch { return line } })
     .join('\n')
 }
+
 function extractYaml(buffer) {
   try { return JSON.stringify(yaml.load(buffer.toString('utf-8')), null, 2) }
   catch { return buffer.toString('utf-8') }
 }
+
 async function extractEml(buffer) {
   const parsed = await simpleParser(buffer)
   const parts  = []
@@ -474,6 +521,7 @@ async function extractEml(buffer) {
   else if (parsed.html) parts.push(`\n${extractHtml(Buffer.from(parsed.html))}`)
   return parts.join('\n')
 }
+
 async function extractEpub(buffer) {
   return new Promise((resolve) => {
     parseOffice(buffer, (text, err) => {
@@ -503,47 +551,51 @@ async function extractTextFromBuffer(buffer, fileName) {
     '.h', '.cs', '.go', '.rb', '.php', '.swift', '.kt', '.r', '.sql',
     '.sh', '.bash', '.ps1',
   ])
-  if (plainText.has(ext)) return buffer.toString('utf-8')
-  if (ext === '.epub')    return extractEpub(buffer)
-  if (ext === '.eml')     return extractEml(buffer)
+  if (plainText.has(ext))                         return buffer.toString('utf-8')
+  if (ext === '.epub')                            return extractEpub(buffer)
+  if (ext === '.eml')                             return extractEml(buffer)
   console.warn(`[extractText] Unsupported extension: ${ext} (${fileName})`)
   return ''
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-//  CHUNKING
+//  CHUNKING — untouched
 // ════════════════════════════════════════════════════════════════════════════
 
 function chunkText(text, sourceFile) {
   const chunks = []
-  let index    = 0
-  const lines  = text.replace(/\r\n/g, '\n').split('\n').map(l => l.trim()).filter(l => l.length > 0)
+  let index = 0
+  const lines = text
+    .replace(/\r\n/g, '\n')
+    .split('\n')
+    .map(l => l.trim())
+    .filter(l => l.length > 0)
   let buffer = []
   for (const line of lines) {
     const projectedLength = buffer.join('\n').length + (buffer.length ? 1 : 0) + line.length
     if (buffer.length > 0 && projectedLength > CHUNK_SIZE) {
-      const str = buffer.join('\n')
-      if (str.length > 30)
-        chunks.push({ text: str, source_file: sourceFile, chunk_index: index++, embedding: [] })
+      const chunkTextStr = buffer.join('\n')
+      if (chunkTextStr.length > 30)
+        chunks.push({ text: chunkTextStr, source_file: sourceFile, chunk_index: index++, embedding: [] })
       buffer = buffer.slice(-CHUNK_OVERLAP)
     }
     buffer.push(line)
   }
   if (buffer.length > 0) {
-    const str = buffer.join('\n')
-    if (str.length > 30)
-      chunks.push({ text: str, source_file: sourceFile, chunk_index: index++, embedding: [] })
+    const chunkTextStr = buffer.join('\n')
+    if (chunkTextStr.length > 30)
+      chunks.push({ text: chunkTextStr, source_file: sourceFile, chunk_index: index++, embedding: [] })
   }
   return chunks
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-//  AZURE BLOB
+//  AZURE BLOB — untouched
 // ════════════════════════════════════════════════════════════════════════════
 
 async function downloadBlobAsBuffer(containerClient, blobName) {
   const download = await containerClient.getBlobClient(blobName).download()
-  const parts    = []
+  const parts = []
   for await (const chunk of download.readableStreamBody)
     parts.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk))
   return Buffer.concat(parts)
@@ -554,18 +606,21 @@ async function loadChunksForClient(clientId) {
   const containerClient = BlobServiceClient
     .fromConnectionString(AZURE_CONNECTION_STRING)
     .getContainerClient(AZURE_CONTAINER_NAME)
-  const prefix    = `${RAW_PREFIX}/${clientId}/`
+  const prefix = `${RAW_PREFIX}/${clientId}/`
   console.log(`[loadChunks] Scanning: "${prefix}"`)
   const allChunks = []
   for await (const blob of containerClient.listBlobsFlat({ prefix })) {
     const fileName = blob.name.split('/').pop()
     const ext      = ('.' + fileName.split('.').pop()).toLowerCase()
-    if (!SUPPORTED_EXTENSIONS.has(ext)) { console.log(`[loadChunks] Skipping: ${fileName}`); continue }
+    if (!SUPPORTED_EXTENSIONS.has(ext)) {
+      console.log(`[loadChunks] Skipping unsupported: ${fileName}`)
+      continue
+    }
     console.log(`[loadChunks] Processing: ${fileName}`)
     try {
       const buffer = await downloadBlobAsBuffer(containerClient, blob.name)
       const text   = await extractTextFromBuffer(buffer, fileName)
-      if (!text?.trim()) { console.warn(`[loadChunks] Empty: ${fileName}`); continue }
+      if (!text?.trim()) { console.warn(`[loadChunks] Empty text: ${fileName}`); continue }
       const chunks = chunkText(text, fileName)
       console.log(`[loadChunks]   ${fileName} → ${chunks.length} chunks`)
       allChunks.push(...chunks)
@@ -578,67 +633,32 @@ async function loadChunksForClient(clientId) {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-//  RETRIEVAL
+//  RETRIEVAL — untouched
 // ════════════════════════════════════════════════════════════════════════════
 
-// FIX 4: cosine similarity was returning values > 1 (300%) due to missing
-// magnitude clamping. Added Math.max guard and proper zero-vector handling.
 function cosineSim(a, b) {
-  if (!a?.length || !b?.length || a.length !== b.length) return 0
   let dot = 0, normA = 0, normB = 0
   for (let i = 0; i < a.length; i++) {
     dot   += a[i] * b[i]
     normA += a[i] * a[i]
     normB += b[i] * b[i]
   }
-  const denom = Math.sqrt(normA) * Math.sqrt(normB)
-  if (denom === 0) return 0
-  // Clamp to [-1, 1] to prevent floating-point drift giving scores > 1
-  return Math.max(-1, Math.min(1, dot / denom))
-}
-
-// FIX 5: Improved keyword search — also matches individual words inside
-// multi-word terms and expands common abbreviations (GL → general ledger)
-const ABBREVIATIONS = {
-  'gl':  ['general ledger', 'gl'],
-  'ap':  ['accounts payable', 'ap'],
-  'ar':  ['accounts receivable', 'ar'],
-  'ytd': ['year to date', 'ytd'],
-  'mtd': ['month to date', 'mtd'],
-}
-
-function expandQuery(query) {
-  const lower = query.toLowerCase()
-  const terms = new Set([lower])
-  for (const [abbr, expansions] of Object.entries(ABBREVIATIONS)) {
-    if (lower.includes(abbr)) {
-      for (const exp of expansions) terms.add(lower.replace(new RegExp(`\\b${abbr}\\b`, 'g'), exp))
-    }
-    for (const exp of expansions) {
-      if (lower.includes(exp)) terms.add(lower.replace(exp, abbr))
-    }
-  }
-  return [...terms]
+  return dot / (Math.sqrt(normA) * Math.sqrt(normB) + 1e-9)
 }
 
 function keywordSearch(query, chunks, topK) {
-  const queryVariants = expandQuery(query)
-  const words = queryVariants
-    .join(' ')
+  const words = query
+    .toLowerCase()
     .replace(/[^\w\s]/g, ' ')
     .split(/\s+/)
     .filter(w => w.length > 1)
-  const uniqueWords = [...new Set(words)]
 
   return chunks
     .map(c => {
-      const lower = (c.text || '').toLowerCase()
-      // Score: each matching word = 1 pt, full phrase match = bonus word-count pts
-      let score = uniqueWords.reduce((acc, w) => acc + (lower.includes(w) ? 1 : 0), 0)
-      for (const variant of queryVariants) {
-        if (lower.includes(variant)) score += uniqueWords.length
-      }
-      return { ...c, _score: score }
+      const chunkLower  = (c.text || '').toLowerCase()
+      const score       = words.reduce((acc, w) => acc + (chunkLower.includes(w) ? 1 : 0), 0)
+      const phraseBonus = chunkLower.includes(query.toLowerCase()) ? words.length : 0
+      return { ...c, _score: score + phraseBonus }
     })
     .filter(c => c._score > 0)
     .sort((a, b) => b._score - a._score)
@@ -652,46 +672,49 @@ async function embedQueryGemini(query) {
 }
 
 async function retrieveChunks(query, chunks, topK = 6) {
-  const normalizedQuery = query.toLowerCase().trim().replace(/[^\w\s]/g, ' ').replace(/\s+/g, ' ')
+  const normalizedQuery = query
+    .toLowerCase()
+    .trim()
+    .replace(/[^\w\s]/g, ' ')
+    .replace(/\s+/g, ' ')
 
-  // FIX 6: Broaden keyword candidate pool — use 200 instead of 100 so we
-  // don't cut off relevant chunks before semantic re-ranking
-  const candidates = keywordSearch(normalizedQuery, chunks, Math.min(200, chunks.length))
-  const pool       = candidates.length > 0 ? candidates : chunks.slice(0, 200)
+  const candidates = keywordSearch(normalizedQuery, chunks, Math.min(100, chunks.length))
+  const pool       = candidates.length > 0 ? candidates : chunks.slice(0, 100)
 
   if (GEMINI_API_KEY) {
     try {
       const queryVec = await embedQueryGemini(normalizedQuery)
       const ai       = new GoogleGenAI({ apiKey: GEMINI_API_KEY })
       const scored   = []
+
       for (const c of pool) {
         try {
+          const chunkTextNorm = (c.text || '').toLowerCase()
           const r = await ai.models.embedContent({
             model:    'text-embedding-004',
-            contents: (c.text || '').toLowerCase(),
+            contents: chunkTextNorm,
           })
-          const sim = cosineSim(queryVec, r.embeddings[0].values)
-          scored.push({ ...c, _score: sim })
+          scored.push({ ...c, _score: cosineSim(queryVec, r.embeddings[0].values) })
         } catch {
           scored.push({ ...c, _score: c._score || 0 })
         }
       }
+
       return scored.sort((a, b) => b._score - a._score).slice(0, Math.min(topK, 20))
     } catch (err) {
-      console.warn('[retrieveChunks] Gemini embed failed, using keyword fallback:', err.message)
+      console.warn('[retrieveChunks] Gemini embed failed, keyword fallback:', err.message)
     }
   }
+
   return pool.slice(0, Math.min(topK, 20))
 }
 
 function buildContext(hits) {
   return hits.map((h, i) => {
-    const src           = h.source_file || 'document'
+    const src = h.source_file || 'document'
     const isSpreadsheet = /\.(xlsx|xls|ods|csv|tsv)$/i.test(src)
-    // FIX 7: More explicit spreadsheet hint so LLM understands field-value structure
     const hint = isSpreadsheet
-      ? '(spreadsheet data — rows are formatted as "ColumnName: Value | ColumnName: Value"; ' +
-        'a term appearing after a colon IS a valid data term/category in this dataset)'
+      ? '(spreadsheet data — each line is a record row; terms appearing as values are real data items)'
       : '(document excerpt)'
     return `[Excerpt ${i + 1} from ${src} ${hint}]\n${(h.text || '').trim()}`
   }).join('\n\n')
@@ -700,28 +723,20 @@ function buildContext(hits) {
 async function answerWithGemini(originalQuery, normalizedQuery, context) {
   const ai = new GoogleGenAI({ apiKey: GEMINI_API_KEY })
 
-  // FIX 8: Two-pass approach — first ask the model to check if term exists,
-  // then answer. Wrapped in a single prompt with explicit presence check.
   const prompt = `${SYSTEM_PROMPT}
 
 ---DOCUMENT CONTEXT START---
 ${context}
 ---DOCUMENT CONTEXT END---
 
-User question: "${originalQuery}"
+The user is asking: "${originalQuery}"
 
-Step 1 — PRESENCE CHECK: Scan every line of the context above for the exact term(s) from the question (case-insensitive). List each line where the term appears.
-
-Step 2 — ANSWER: Based on what you found in Step 1:
-- If you found the term, explain what the context says about it in plain English. Do NOT expose raw field names (Field1, Field2, etc) or say "Field4". Instead say something like "it is a category/type of..." based on context.
-- If the term was genuinely absent from all lines, say exactly: "I couldn't find specific information about that in your documents."
-
-Write only the final answer (not the Step 1 check) in your response.`
+Before answering, scan the entire context above for any occurrence of the key terms in the question (case-insensitive). If you find it anywhere — as a row value, column value, label, or text — explain what the context says about it in plain English. Do not say it is missing if it appears anywhere in the data above.`
 
   const res = await ai.models.generateContent({
     model:    'gemini-2.5-flash',
     contents: prompt,
-    config:   { temperature: 0.2, maxOutputTokens: 1024 },
+    config:   { temperature: 0.4, maxOutputTokens: 1024 },
   })
   return res.text
 }
@@ -742,13 +757,20 @@ app.post('/chat/login', async (req, res) => {
     const client = await verifyApiKey(apiKey)
     if (!client) return res.status(401).json({ error: 'Invalid API key' })
     res.json({ ok: true, client })
-  } catch (err) { console.error('POST /chat/login:', err); res.status(500).json({ error: err.message }) }
+  } catch (err) {
+    console.error('POST /chat/login:', err)
+    res.status(500).json({ error: err.message })
+  }
 })
 
+// Auth changed: no clientId+clientPassword in body — identity from middleware.
+// RAG logic, history saving, response shape: all identical to old backend.
 app.post('/chat/message', requireClientKey, async (req, res) => {
   try {
     const { query, topK = 6, conversationId } = req.body
-    if (!query?.trim()) return res.status(400).json({ error: 'query is required' })
+
+    if (!query?.trim())
+      return res.status(400).json({ error: 'query is required' })
 
     const { clientId, name } = req.client
     const normalizedQuery    = query.trim().toLowerCase()
@@ -757,7 +779,8 @@ app.post('/chat/message', requireClientKey, async (req, res) => {
     if (chunks.length === 0) {
       return res.json({
         answer: 'No documents found for your account. Please ensure your documents have been ingested first.',
-        sources: [], client: { clientId, name },
+        sources: [],
+        client: { clientId, name },
       })
     }
 
@@ -765,21 +788,17 @@ app.post('/chat/message', requireClientKey, async (req, res) => {
     if (hits.length === 0) {
       return res.json({
         answer: "I couldn't find that in your documents. Try rephrasing your question or asking about it differently.",
-        sources: [], client: { clientId, name },
+        sources: [],
+        client: { clientId, name },
       })
     }
 
     const answer  = await answerWithGemini(query.trim(), normalizedQuery, buildContext(hits))
-
-    // FIX 9: Normalize score to percentage properly — cosineSim now returns [-1,1]
-    // so multiply by 100 for display, clamped to 0-100
     const sources = hits.map(h => ({
       source_file: h.source_file || 'unknown',
       chunk_index: h.chunk_index ?? 0,
-      score:       typeof h._score === 'number'
-        ? Math.max(0, Math.min(100, parseFloat((h._score * 100).toFixed(1))))
-        : null,
-      preview: (h.text || '').slice(0, 300),
+      score:       typeof h._score === 'number' ? parseFloat(h._score.toFixed(4)) : null,
+      preview:     (h.text || '').slice(0, 300),
     }))
 
     try {
@@ -788,7 +807,8 @@ app.post('/chat/message', requireClientKey, async (req, res) => {
       const now          = new Date()
       const userMsg      = { role: 'user', content: query.trim(), timestamp: now }
       const assistantMsg = {
-        role: 'assistant', content: answer,
+        role:    'assistant',
+        content: answer,
         sources: sources.map(s => ({ source_file: s.source_file, score: s.score })),
         timestamp: now,
       }
@@ -796,13 +816,20 @@ app.post('/chat/message', requireClientKey, async (req, res) => {
       if (conversationId) {
         await col.updateOne(
           { _id: new ObjectId(conversationId), clientId },
-          { $push: { messages: { $each: [userMsg, assistantMsg] } }, $set: { updatedAt: now } }
+          {
+            $push: { messages: { $each: [userMsg, assistantMsg] } },
+            $set:  { updatedAt: now },
+          }
         )
         res.json({ answer, sources, client: { clientId, name }, conversationId })
       } else {
+        const title  = generateTitle(query.trim())
         const result = await col.insertOne({
-          clientId, title: generateTitle(query.trim()),
-          messages: [userMsg, assistantMsg], createdAt: now, updatedAt: now,
+          clientId,
+          title,
+          messages:  [userMsg, assistantMsg],
+          createdAt: now,
+          updatedAt: now,
         })
         res.json({ answer, sources, client: { clientId, name }, conversationId: result.insertedId.toString() })
       }
