@@ -12,9 +12,32 @@ const yaml = require('js-yaml')
 const Papa = require('papaparse')
 const { simpleParser } = require('mailparser')
 const { parseOffice } = require('officeparser')
+
+//cors and midddleware
 const app = express()
-app.use(cors())
+const allowedOrigins = [
+  "https://localhost:8080",
+  "https://app.powerbi.com",
+  "https://msit.powerbi.com"
+]
+app.use(cors({
+  origin: function (origin, callback) {
+    if (!origin) return callback(null, true)
+
+    if (allowedOrigins.includes(origin)) {
+      return callback(null, true)
+    }
+
+    return callback(new Error("Blocked by CORS"))
+  },
+  methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+  allowedHeaders: ["Content-Type", "Authorization"],
+  credentials: true
+}))
+
+app.options("*", (req, res) => res.sendStatus(200))
 app.use(express.json())
+
 const MONGODB_URI = process.env.MONGODB_URI
 const MONGODB_DB  = process.env.MONGODB_DB || 'clientcreds'
 const CHAT_HISTORY_URI = process.env.CHAT_HISTORY_URI
