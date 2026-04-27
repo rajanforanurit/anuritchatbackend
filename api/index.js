@@ -16,7 +16,7 @@ const { parseOffice } = require('officeparser')
 //cors and midddleware
 const app = express()
 const allowedOrigins = [
-  "https://localhost:8080",
+  "http://localhost:8080",
   "https://app.powerbi.com",
   "https://msit.powerbi.com"
 ]
