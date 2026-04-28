@@ -20,6 +20,7 @@ const allowedOrigins = [
   "http://localhost:3000",
   "https://app.powerbi.com",
   "https://msit.powerbi.com",
+  "https://anuritchat.vercel.app",
   "https://df.powerbi.com",
   "https://api.powerbi.com",
 ]
