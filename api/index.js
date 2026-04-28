@@ -26,17 +26,25 @@ const allowedOrigins = [
 
 app.use(cors({
   origin: function (origin, callback) {
-    // Allow requests with no origin (mobile apps, curl, Postman, server-to-server)
     if (!origin) return callback(null, true)
     if (allowedOrigins.includes(origin)) return callback(null, true)
-    // Allow any powerbi.com or microsoft.com subdomain
     if (/\.(powerbi|microsoft|office)\.com$/.test(origin)) return callback(null, true)
-    return callback(new Error("Blocked by CORS"))
+    // Don't throw — just block silently
+    return callback(null, false)
   },
   methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
   allowedHeaders: ["Content-Type", "Authorization"],
   credentials: true,
 }))
+
+// Separate blanket OPTIONS handler BEFORE routes
+app.options("*", (req, res) => {
+  res.setHeader("Access-Control-Allow-Origin", req.headers.origin || "*")
+  res.setHeader("Access-Control-Allow-Methods", "GET,POST,PUT,PATCH,DELETE,OPTIONS")
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type,Authorization")
+  res.setHeader("Access-Control-Allow-Credentials", "true")
+  res.sendStatus(204)
+})
 
 // OPTIONS preflight must come BEFORE any other route or middleware
 app.options("*", cors({
