@@ -17,25 +17,39 @@ const { parseOffice } = require('officeparser')
 const app = express()
 const allowedOrigins = [
   "http://localhost:8080",
+  "http://localhost:3000",
   "https://app.powerbi.com",
-  "https://msit.powerbi.com"
+  "https://msit.powerbi.com",
+  "https://df.powerbi.com",
+  "https://api.powerbi.com",
 ]
+
 app.use(cors({
   origin: function (origin, callback) {
+    // Allow requests with no origin (mobile apps, curl, Postman, server-to-server)
     if (!origin) return callback(null, true)
-
-    if (allowedOrigins.includes(origin)) {
-      return callback(null, true)
-    }
-
+    if (allowedOrigins.includes(origin)) return callback(null, true)
+    // Allow any powerbi.com or microsoft.com subdomain
+    if (/\.(powerbi|microsoft|office)\.com$/.test(origin)) return callback(null, true)
     return callback(new Error("Blocked by CORS"))
   },
   methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
   allowedHeaders: ["Content-Type", "Authorization"],
-  credentials: true
+  credentials: true,
 }))
 
-app.options("*", (req, res) => res.sendStatus(200))
+// OPTIONS preflight must come BEFORE any other route or middleware
+app.options("*", cors({
+  origin: function (origin, callback) {
+    if (!origin) return callback(null, true)
+    if (allowedOrigins.includes(origin)) return callback(null, true)
+    if (/\.(powerbi|microsoft|office)\.com$/.test(origin)) return callback(null, true)
+    return callback(null, true) // be permissive on preflight
+  },
+  methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+  allowedHeaders: ["Content-Type", "Authorization"],
+  credentials: true,
+}))
 app.use(express.json())
 
 const MONGODB_URI = process.env.MONGODB_URI
