@@ -16,48 +16,58 @@ const { parseOffice } = require('officeparser')
 const app = express()
 
 const allowedOrigins = [
-  "http://localhost:8080",
-  "http://localhost:3000",
-  "https://app.powerbi.com",
-  "https://msit.powerbi.com",
-  "https://anuritchat.vercel.app",
-  "https://df.powerbi.com",
-  "https://api.powerbi.com",
+  'http://localhost:8080',
+  'http://localhost:3000',
+  'https://app.powerbi.com',
+  'https://msit.powerbi.com',
+  'https://anuritchat.vercel.app',
+  'https://df.powerbi.com',
+  'https://api.powerbi.com',
 ]
 
+// ─── CORS origin check ────────────────────────────────────────────────────────
+// Power BI Desktop runs visuals inside a sandboxed WebView2 iframe.
+// That iframe sends Origin: null (the literal string "null") or omits the
+// Origin header entirely. Both cases must be allowed.
 function originAllowed(origin) {
-  if (!origin) return true
-  if (allowedOrigins.includes(origin)) return true
-  if (/\.(powerbi|microsoft|office)\.com$/.test(origin)) return true
+  if (!origin) return true                                          // no header at all
+  if (origin === 'null') return true                                // WebView2 sandboxed iframe
+  if (allowedOrigins.includes(origin)) return true                 // explicit allowlist
+  if (/\.(powerbi|microsoft|office)\.com$/.test(origin)) return true // PBI service domains
   return false
 }
 
 app.use(cors({
   origin: (origin, callback) => callback(null, originAllowed(origin)),
-  methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-  allowedHeaders: ["Content-Type", "Authorization"],
+  methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization'],
   credentials: true,
 }))
 
-app.options("*", cors({
+app.options('*', cors({
   origin: (origin, callback) => callback(null, true),
-  methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-  allowedHeaders: ["Content-Type", "Authorization"],
+  methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization'],
   credentials: true,
 }))
 
 app.use(express.json())
 
-const MONGODB_URI = process.env.MONGODB_URI
-const MONGODB_DB = process.env.MONGODB_DB || 'clientcreds'
-const CHAT_HISTORY_URI = process.env.CHAT_HISTORY_URI
-const CHAT_HISTORY_DB = process.env.CHAT_HISTORY_DB || 'chathistory'
+// ─── Env / constants ──────────────────────────────────────────────────────────
+const MONGODB_URI          = process.env.MONGODB_URI
+const MONGODB_DB           = process.env.MONGODB_DB           || 'clientcreds'
+const CHAT_HISTORY_URI     = process.env.CHAT_HISTORY_URI
+const CHAT_HISTORY_DB      = process.env.CHAT_HISTORY_DB      || 'chathistory'
 const AZURE_CONNECTION_STRING = process.env.AZURE_CONNECTION_STRING || ''
 const AZURE_CONTAINER_NAME = process.env.AZURE_CONTAINER_NAME || 'vectordbforrag'
-const GEMINI_API_KEY = process.env.GEMINI_API_KEY || ''
-const RAW_PREFIX = 'raw'
-const CHUNK_SIZE = 500
-const CHUNK_OVERLAP = 2
+const GEMINI_API_KEY       = process.env.GEMINI_API_KEY       || ''
+const RAW_PREFIX           = 'raw'
+const CHUNK_SIZE           = 500
+const CHUNK_OVERLAP        = 2
+
+// How often the background key-health checker polls (ms). 5 minutes by default.
+const KEY_CHECK_INTERVAL_MS = parseInt(process.env.KEY_CHECK_INTERVAL_MS || '300000', 10)
+
 const SYSTEM_PROMPT = `You are a helpful business document assistant. Your job is to answer questions based on document content provided to you.
 
 CRITICAL READING INSTRUCTIONS — read these carefully before answering:
@@ -94,6 +104,7 @@ const SUPPORTED_EXTENSIONS = new Set([
   '.epub', '.eml',
 ])
 
+// ─── DB connections ───────────────────────────────────────────────────────────
 let db = null
 async function getDb() {
   if (db) return db
@@ -114,8 +125,9 @@ async function getChatDb() {
   return chatDb
 }
 
-const CLIENT_CACHE = new Map()
-const CACHE_TTL_MS = 5 * 60 * 1000
+// ─── Client cache ─────────────────────────────────────────────────────────────
+const CLIENT_CACHE  = new Map()
+const CACHE_TTL_MS  = 5 * 60 * 1000   // 5 min — intentionally shorter than the health-check interval
 
 function getCached(apiKey) {
   const entry = CLIENT_CACHE.get(apiKey)
@@ -125,30 +137,84 @@ function getCached(apiKey) {
 }
 function setCache(apiKey, data) { CLIENT_CACHE.set(apiKey, { ...data, cachedAt: Date.now() }) }
 function evictCache(apiKey) { if (apiKey) CLIENT_CACHE.delete(apiKey) }
-
 async function verifyApiKey(apiKey) {
   if (!apiKey || !apiKey.startsWith('rak_')) return null
+
+  // Fast path: cache hit (TTL-bounded so revoked keys are detected within CACHE_TTL_MS)
   const cached = getCached(apiKey)
   if (cached) return { clientId: cached.clientId, name: cached.name }
+
+  // Slow path: database lookup
   const database = await getDb()
   const client = await database.collection('clients').findOne(
-    { apiKey }, { projection: { clientId: 1, name: 1, _id: 0 } }
+    { apiKey },
+    { projection: { clientId: 1, name: 1, _id: 0 } }
   )
   if (!client) return null
+
+  // Re-cache only on success — an invalid key should never be cached
   setCache(apiKey, { clientId: client.clientId, name: client.name })
   return { clientId: client.clientId, name: client.name }
 }
 
+function startApiKeyHealthChecker() {
+  if (!MONGODB_URI) {
+    console.warn('[healthChecker] MONGODB_URI not set — health checker disabled')
+    return
+  }
+
+  console.log(`[healthChecker] Starting — polling every ${KEY_CHECK_INTERVAL_MS / 1000}s`)
+
+  setInterval(async () => {
+    const keys = [...CLIENT_CACHE.keys()]
+    if (keys.length === 0) return
+
+    console.log(`[healthChecker] Checking ${keys.length} cached key(s)`)
+    let evicted = 0
+
+    try {
+      const database = await getDb()
+      const col = database.collection('clients')
+
+      // Batch: fetch all matching keys in one round-trip
+      const validDocs = await col
+        .find({ apiKey: { $in: keys } }, { projection: { apiKey: 1, _id: 0 } })
+        .toArray()
+
+      const validSet = new Set(validDocs.map(d => d.apiKey))
+
+      for (const key of keys) {
+        if (!validSet.has(key)) {
+          evictCache(key)
+          evicted++
+          console.log(`[healthChecker] Evicted revoked key: ${key.slice(0, 10)}…`)
+        }
+      }
+
+      if (evicted > 0) {
+        console.log(`[healthChecker] Evicted ${evicted} revoked key(s)`)
+      }
+    } catch (err) {
+      // Non-fatal: log and continue. The per-request verifyApiKey is the safety net.
+      console.error('[healthChecker] Poll failed:', err.message)
+    }
+  }, KEY_CHECK_INTERVAL_MS)
+}
+
+// ─── Auth helpers ─────────────────────────────────────────────────────────────
 function extractApiKey(req) {
   const header = req.headers['authorization'] || ''
   return header.startsWith('Bearer ') ? header.slice(7).trim() : null
 }
 
 async function requireClientKey(req, res, next) {
-  const apiKey = extractApiKey(req)
+  // Accept key from Authorization header (primary) or request body (fallback for PBI Desktop)
+  const apiKey = extractApiKey(req) || req.body?.apiKey
   if (!apiKey) return res.status(401).json({ error: 'Missing API key' })
+
   const client = await verifyApiKey(apiKey)
   if (!client) return res.status(401).json({ error: 'Invalid or expired API key' })
+
   req.client = client
   next()
 }
@@ -160,8 +226,24 @@ function requireAdminKey(req, res, next) {
   next()
 }
 
+// ─── Health ───────────────────────────────────────────────────────────────────
 app.get('/health', (req, res) => res.json({ ok: true, service: 'rag-client-auth' }))
+app.post('/client/verify', async (req, res) => {
+  try {
+    const apiKey = extractApiKey(req) || req.body?.apiKey
+    if (!apiKey) return res.status(400).json({ valid: false, error: 'apiKey is required' })
 
+    const client = await verifyApiKey(apiKey)
+    if (!client) return res.status(401).json({ valid: false, error: 'Invalid or expired API key' })
+
+    res.json({ valid: true, client })
+  } catch (err) {
+    console.error('POST /client/verify:', err)
+    res.status(500).json({ valid: false, error: err.message })
+  }
+})
+
+// ─── Admin routes ─────────────────────────────────────────────────────────────
 app.post('/admin/clients', requireAdminKey, async (req, res) => {
   try {
     const { name, clientId, apiKey } = req.body
@@ -169,6 +251,7 @@ app.post('/admin/clients', requireAdminKey, async (req, res) => {
       return res.status(400).json({ error: 'name, clientId, and apiKey are all required' })
     if (!apiKey.startsWith('rak_'))
       return res.status(400).json({ error: 'apiKey must start with "rak_"' })
+
     const database = await getDb()
     const col = database.collection('clients')
     const existing = await col.findOne({ $or: [{ clientId }, { apiKey }] })
@@ -176,6 +259,7 @@ app.post('/admin/clients', requireAdminKey, async (req, res) => {
       const field = existing.clientId === clientId ? 'clientId' : 'apiKey'
       return res.status(409).json({ error: `A client with this ${field} already exists` })
     }
+
     const now = new Date().toISOString()
     const doc = {
       name: name.trim(),
@@ -244,8 +328,12 @@ app.delete('/admin/clients/:clientId', requireAdminKey, async (req, res) => {
     const database = await getDb()
     const client = await database.collection('clients').findOne({ clientId })
     if (!client) return res.status(404).json({ error: 'Client not found' })
+
+    // Evict cache immediately so the key stops working at once
     if (client.apiKey) evictCache(client.apiKey)
+
     await database.collection('clients').deleteOne({ clientId })
+
     const blobsDeleted = [], blobsFailed = []
     if (AZURE_CONNECTION_STRING) {
       try {
@@ -261,6 +349,7 @@ app.delete('/admin/clients/:clientId', requireAdminKey, async (req, res) => {
         blobsFailed.push({ name: 'azure-connection', error: azureErr.message })
       }
     }
+
     res.json({
       ok: true, deleted: clientId,
       blobsDeleted: blobsDeleted.length,
@@ -272,15 +361,35 @@ app.delete('/admin/clients/:clientId', requireAdminKey, async (req, res) => {
   }
 })
 
+// ─── Client auth routes ───────────────────────────────────────────────────────
 app.post('/client/login', async (req, res) => {
   try {
-    const apiKey = req.body.apiKey || extractApiKey(req)
+    // Accept key from Authorization header (PBI Desktop WebView2) or body (web)
+    const apiKey = extractApiKey(req) || req.body?.apiKey
     if (!apiKey) return res.status(400).json({ error: 'apiKey is required' })
+
     const client = await verifyApiKey(apiKey)
     if (!client) return res.status(401).json({ error: 'Invalid API key' })
+
     res.json({ ok: true, client })
   } catch (err) {
     console.error('POST /client/login:', err)
+    res.status(500).json({ error: err.message })
+  }
+})
+
+// Alias used by ChatApp.tsx
+app.post('/chat/login', async (req, res) => {
+  try {
+    const apiKey = extractApiKey(req) || req.body?.apiKey
+    if (!apiKey) return res.status(400).json({ error: 'apiKey is required' })
+
+    const client = await verifyApiKey(apiKey)
+    if (!client) return res.status(401).json({ error: 'Invalid API key' })
+
+    res.json({ ok: true, client })
+  } catch (err) {
+    console.error('POST /chat/login:', err)
     res.status(500).json({ error: err.message })
   }
 })
@@ -296,6 +405,7 @@ app.get('/client/me', requireClientKey, async (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }) }
 })
 
+// ─── Conversation routes ──────────────────────────────────────────────────────
 app.post('/chat/conversations', requireClientKey, async (req, res) => {
   try {
     const { title } = req.body
@@ -385,6 +495,7 @@ app.post('/chat/conversations/delete', requireClientKey, async (req, res) => {
   }
 })
 
+// ─── Document extraction ──────────────────────────────────────────────────────
 async function extractPdf(buffer) {
   const result = await pdfParse(buffer)
   return result.text || ''
@@ -488,10 +599,10 @@ async function extractEml(buffer) {
   const parsed = await simpleParser(buffer)
   const parts = []
   if (parsed.subject) parts.push(`Subject: ${parsed.subject}`)
-  if (parsed.from) parts.push(`From: ${parsed.from.text}`)
-  if (parsed.to) parts.push(`To: ${parsed.to.text}`)
-  if (parsed.date) parts.push(`Date: ${parsed.date}`)
-  if (parsed.text) parts.push(`\n${parsed.text}`)
+  if (parsed.from)    parts.push(`From: ${parsed.from.text}`)
+  if (parsed.to)      parts.push(`To: ${parsed.to.text}`)
+  if (parsed.date)    parts.push(`Date: ${parsed.date}`)
+  if (parsed.text)    parts.push(`\n${parsed.text}`)
   else if (parsed.html) parts.push(`\n${extractHtml(Buffer.from(parsed.html))}`)
   return parts.join('\n')
 }
@@ -506,20 +617,20 @@ async function extractEpub(buffer) {
 
 async function extractTextFromBuffer(buffer, fileName) {
   const ext = ('.' + fileName.split('.').pop()).toLowerCase()
-  if (ext === '.pdf') return extractPdf(buffer)
+  if (ext === '.pdf')  return extractPdf(buffer)
   if (ext === '.docx' || ext === '.doc') return extractWord(buffer)
-  if (ext === '.odt' || ext === '.rtf') return extractOffice(buffer)
+  if (ext === '.odt'  || ext === '.rtf') return extractOffice(buffer)
   if (['.xlsx', '.xls', '.ods'].includes(ext)) return extractSpreadsheet(buffer)
-  if (ext === '.csv') return extractCsv(buffer, ',')
-  if (ext === '.tsv') return extractCsv(buffer, '\t')
+  if (ext === '.csv')  return extractCsv(buffer, ',')
+  if (ext === '.tsv')  return extractCsv(buffer, '\t')
   if (ext === '.pptx' || ext === '.ppt') return extractOffice(buffer)
   if (ext === '.html' || ext === '.htm') return extractHtml(buffer)
-  if (ext === '.xml') return extractXml(buffer)
+  if (ext === '.xml')  return extractXml(buffer)
   if (['.md', '.markdown', '.rst'].includes(ext)) return buffer.toString('utf-8')
-  if (ext === '.json') return extractJson(buffer)
+  if (ext === '.json')  return extractJson(buffer)
   if (ext === '.jsonl') return extractJsonl(buffer)
   if (ext === '.yaml' || ext === '.yml') return extractYaml(buffer)
-  if (ext === '.toml') return buffer.toString('utf-8')
+  if (ext === '.toml')  return buffer.toString('utf-8')
   const plainText = new Set([
     '.txt', '.py', '.js', '.ts', '.jsx', '.tsx', '.java', '.cpp', '.c',
     '.h', '.cs', '.go', '.rb', '.php', '.swift', '.kt', '.r', '.sql',
@@ -527,11 +638,12 @@ async function extractTextFromBuffer(buffer, fileName) {
   ])
   if (plainText.has(ext)) return buffer.toString('utf-8')
   if (ext === '.epub') return extractEpub(buffer)
-  if (ext === '.eml') return extractEml(buffer)
+  if (ext === '.eml')  return extractEml(buffer)
   console.warn(`[extractText] Unsupported extension: ${ext} (${fileName})`)
   return ''
 }
 
+// ─── Chunking ─────────────────────────────────────────────────────────────────
 function chunkText(text, sourceFile) {
   const chunks = []
   let index = 0
@@ -555,6 +667,7 @@ function chunkText(text, sourceFile) {
   return chunks
 }
 
+// ─── Azure blob helpers ───────────────────────────────────────────────────────
 async function downloadBlobAsBuffer(containerClient, blobName) {
   const download = await containerClient.getBlobClient(blobName).download()
   const parts = []
@@ -591,10 +704,11 @@ async function loadChunksForClient(clientId) {
   return allChunks
 }
 
+// ─── Retrieval ────────────────────────────────────────────────────────────────
 function cosineSim(a, b) {
   let dot = 0, normA = 0, normB = 0
   for (let i = 0; i < a.length; i++) {
-    dot += a[i] * b[i]
+    dot   += a[i] * b[i]
     normA += a[i] * a[i]
     normB += b[i] * b[i]
   }
@@ -605,8 +719,8 @@ function keywordSearch(query, chunks, topK) {
   const words = query.toLowerCase().replace(/[^\w\s]/g, ' ').split(/\s+/).filter(w => w.length > 1)
   return chunks
     .map(c => {
-      const chunkLower = (c.text || '').toLowerCase()
-      const score = words.reduce((acc, w) => acc + (chunkLower.includes(w) ? 1 : 0), 0)
+      const chunkLower  = (c.text || '').toLowerCase()
+      const score       = words.reduce((acc, w) => acc + (chunkLower.includes(w) ? 1 : 0), 0)
       const phraseBonus = chunkLower.includes(query.toLowerCase()) ? words.length : 0
       return { ...c, _score: score + phraseBonus }
     })
@@ -625,6 +739,7 @@ async function retrieveChunks(query, chunks, topK = 6) {
   const normalizedQuery = query.toLowerCase().trim().replace(/[^\w\s]/g, ' ').replace(/\s+/g, ' ')
   const candidates = keywordSearch(normalizedQuery, chunks, Math.min(100, chunks.length))
   const pool = candidates.length > 0 ? candidates : chunks.slice(0, 100)
+
   if (GEMINI_API_KEY) {
     try {
       const queryVec = await embedQueryGemini(normalizedQuery)
@@ -669,6 +784,7 @@ ${context}
 The user is asking: "${originalQuery}"
 
 Before answering, scan the entire context above for any occurrence of the key terms in the question (case-insensitive). If you find it anywhere — as a row value, column value, label, or text — explain what the context says about it in plain English. Do not say it is missing if it appears anywhere in the data above.`
+
   const res = await ai.models.generateContent({
     model: 'gemini-2.5-flash',
     contents: prompt,
@@ -682,25 +798,14 @@ function generateTitle(query) {
   return cleaned.length > 50 ? cleaned.slice(0, 50) + '…' : cleaned
 }
 
-app.post('/chat/login', async (req, res) => {
-  try {
-    const apiKey = req.body.apiKey || extractApiKey(req)
-    if (!apiKey) return res.status(400).json({ error: 'apiKey is required' })
-    const client = await verifyApiKey(apiKey)
-    if (!client) return res.status(401).json({ error: 'Invalid API key' })
-    res.json({ ok: true, client })
-  } catch (err) {
-    console.error('POST /chat/login:', err)
-    res.status(500).json({ error: err.message })
-  }
-})
-
+// ─── Chat message route ───────────────────────────────────────────────────────
 app.post('/chat/message', requireClientKey, async (req, res) => {
   try {
     const { query, topK = 6, conversationId } = req.body
     if (!query?.trim()) return res.status(400).json({ error: 'query is required' })
     const { clientId, name } = req.client
     const normalizedQuery = query.trim().toLowerCase()
+
     const chunks = await loadChunksForClient(clientId)
     if (chunks.length === 0) {
       return res.json({
@@ -709,6 +814,7 @@ app.post('/chat/message', requireClientKey, async (req, res) => {
         client: { clientId, name },
       })
     }
+
     const hits = await retrieveChunks(normalizedQuery, chunks, Math.min(topK, 20))
     if (hits.length === 0) {
       return res.json({
@@ -717,13 +823,15 @@ app.post('/chat/message', requireClientKey, async (req, res) => {
         client: { clientId, name },
       })
     }
+
     const answer = await answerWithGemini(query.trim(), normalizedQuery, buildContext(hits))
     const sources = hits.map(h => ({
-      source_file: h.source_file || 'unknown',
-      chunk_index: h.chunk_index ?? 0,
+      source_file:  h.source_file || 'unknown',
+      chunk_index:  h.chunk_index ?? 0,
       score: typeof h._score === 'number' ? parseFloat(h._score.toFixed(4)) : null,
       preview: (h.text || '').slice(0, 300),
     }))
+
     try {
       const chatDatabase = await getChatDb()
       const col = chatDatabase.collection('conversations')
@@ -735,6 +843,7 @@ app.post('/chat/message', requireClientKey, async (req, res) => {
         sources: sources.map(s => ({ source_file: s.source_file, score: s.score })),
         timestamp: now,
       }
+
       if (conversationId) {
         await col.updateOne(
           { _id: new ObjectId(conversationId), clientId },
@@ -760,6 +869,11 @@ app.post('/chat/message', requireClientKey, async (req, res) => {
   }
 })
 
+// ─── Start ────────────────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 4000
-app.listen(PORT, () => console.log(`rag-client-auth running on port ${PORT}`))
+app.listen(PORT, () => {
+  console.log(`rag-client-auth running on port ${PORT}`)
+  startApiKeyHealthChecker()
+})
+
 module.exports = app
