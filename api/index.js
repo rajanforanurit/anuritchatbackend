@@ -26,14 +26,11 @@ const allowedOrigins = [
 ]
 
 // ─── CORS origin check ────────────────────────────────────────────────────────
-// Power BI Desktop runs visuals inside a sandboxed WebView2 iframe.
-// That iframe sends Origin: null (the literal string "null") or omits the
-// Origin header entirely. Both cases must be allowed.
 function originAllowed(origin) {
-  if (!origin) return true                                          // no header at all
-  if (origin === 'null') return true                                // WebView2 sandboxed iframe
-  if (allowedOrigins.includes(origin)) return true                 // explicit allowlist
-  if (/\.(powerbi|microsoft|office)\.com$/.test(origin)) return true // PBI service domains
+  if (!origin) return true
+  if (origin === 'null') return true
+  if (allowedOrigins.includes(origin)) return true
+  if (/\.(powerbi|microsoft|office)\.com$/.test(origin)) return true
   return false
 }
 
@@ -54,42 +51,17 @@ app.options('*', cors({
 app.use(express.json())
 
 // ─── Env / constants ──────────────────────────────────────────────────────────
-const MONGODB_URI          = process.env.MONGODB_URI
-const MONGODB_DB           = process.env.MONGODB_DB           || 'clientcreds'
-const CHAT_HISTORY_URI     = process.env.CHAT_HISTORY_URI
-const CHAT_HISTORY_DB      = process.env.CHAT_HISTORY_DB      || 'chathistory'
+const MONGODB_URI             = process.env.MONGODB_URI
+const MONGODB_DB              = process.env.MONGODB_DB           || 'clientcreds'
+const CHAT_HISTORY_URI        = process.env.CHAT_HISTORY_URI
+const CHAT_HISTORY_DB         = process.env.CHAT_HISTORY_DB      || 'chathistory'
 const AZURE_CONNECTION_STRING = process.env.AZURE_CONNECTION_STRING || ''
-const AZURE_CONTAINER_NAME = process.env.AZURE_CONTAINER_NAME || 'vectordbforrag'
-const GEMINI_API_KEY       = process.env.GEMINI_API_KEY       || ''
-const RAW_PREFIX           = 'raw'
-const CHUNK_SIZE           = 500
-const CHUNK_OVERLAP        = 2
-
-// How often the background key-health checker polls (ms). 5 minutes by default.
-const KEY_CHECK_INTERVAL_MS = parseInt(process.env.KEY_CHECK_INTERVAL_MS || '300000', 10)
-
-const SYSTEM_PROMPT = `You are a helpful business document assistant. Your job is to answer questions based on document content provided to you.
-
-CRITICAL READING INSTRUCTIONS — read these carefully before answering:
-
-1. SPREADSHEET DATA: The context may contain data extracted from Excel or spreadsheet files. This data appears as rows of key-value pairs like:
-   "Field1: GL Activity | Field2: General Ledger | Field3: Used for tracking"
-   Each row represents one record. Terms appearing as VALUES in these rows are real data — treat them as defined, named items in the document.
-
-2. DO NOT require a formal "definition" to exist. If a term like "GL Activity" appears anywhere in the context — as a column value, a row label, a list item, or inline text — it IS present in the documents. Describe what the context shows about it.
-
-3. INTERPRET ROWS INTELLIGENTLY: If you see a row like "Category: GL Activity | Description: General Ledger transaction type | Code: GLA" — that row IS the definition. Read it and explain it conversationally.
-
-4. CASE INSENSITIVE: Treat "gl activity", "GL Activity", "GL ACTIVITY" as the same thing.
-
-5. NEVER say "the context does not define", "not mentioned in the context", "the provided context does not contain", or similar refusals — these are forbidden responses if the term appears ANYWHERE in the context data. Search carefully before concluding something is absent.
-
-6. If after genuinely searching the entire context the term truly does not appear in any form, respond with: "I couldn't find specific information about that in your documents."
-
-7. Do NOT add [1], [2], [3] or any citation numbers in your response.
-8. Do NOT mention file names or source documents in your answer.
-9. Write like a knowledgeable human colleague — clear, direct, conversational. No robotic phrasing.
-10. Answer only what was asked. Be concise.`
+const AZURE_CONTAINER_NAME    = process.env.AZURE_CONTAINER_NAME || 'vectordbforrag'
+const GEMINI_API_KEY          = process.env.GEMINI_API_KEY       || ''
+const RAW_PREFIX              = 'raw'
+const CHUNK_SIZE              = 500
+const CHUNK_OVERLAP           = 2
+const KEY_CHECK_INTERVAL_MS   = parseInt(process.env.KEY_CHECK_INTERVAL_MS || '300000', 10)
 
 const SUPPORTED_EXTENSIONS = new Set([
   '.pdf', '.docx', '.doc', '.txt', '.rtf', '.odt',
@@ -103,6 +75,209 @@ const SUPPORTED_EXTENSIONS = new Set([
   '.r', '.sql', '.sh', '.bash', '.ps1',
   '.epub', '.eml',
 ])
+
+// ─── Document type classifier ─────────────────────────────────────────────────
+const DOC_TYPE = {
+  SPREADSHEET: 'spreadsheet',
+  PDF:         'pdf',
+  WORD:        'word',
+  PRESENTATION:'presentation',
+  CODE:        'code',
+  DATA:        'data',        // json/yaml/csv structured data
+  TEXT:        'text',        // plain text / markdown
+  EMAIL:       'email',
+  WEB:         'web',         // html/xml
+  UNKNOWN:     'unknown',
+}
+
+function classifyExtension(fileName) {
+  const ext = ('.' + fileName.split('.').pop()).toLowerCase()
+  if (['.xlsx', '.xls', '.ods'].includes(ext))                      return DOC_TYPE.SPREADSHEET
+  if (ext === '.pdf')                                                 return DOC_TYPE.PDF
+  if (['.docx', '.doc', '.odt', '.rtf'].includes(ext))              return DOC_TYPE.WORD
+  if (['.pptx', '.ppt'].includes(ext))                              return DOC_TYPE.PRESENTATION
+  if (['.py', '.js', '.ts', '.jsx', '.tsx', '.java', '.cpp',
+       '.c', '.h', '.cs', '.go', '.rb', '.php', '.swift',
+       '.kt', '.r', '.sql', '.sh', '.bash', '.ps1'].includes(ext)) return DOC_TYPE.CODE
+  if (['.json', '.jsonl', '.yaml', '.yml', '.toml',
+       '.csv', '.tsv'].includes(ext))                               return DOC_TYPE.DATA
+  if (['.txt', '.md', '.markdown', '.rst'].includes(ext))           return DOC_TYPE.TEXT
+  if (ext === '.eml')                                               return DOC_TYPE.EMAIL
+  if (['.html', '.htm', '.xml'].includes(ext))                      return DOC_TYPE.WEB
+  return DOC_TYPE.UNKNOWN
+}
+function inferSchema(fileName, textSamples) {
+  const type = classifyExtension(fileName)
+  const schema = { type, fileName, columns: [], sampleValues: [], topics: [] }
+
+  if (type === DOC_TYPE.SPREADSHEET || type === DOC_TYPE.DATA) {
+    // Columns appear as "Key: Value | Key2: Value2" in the serialised text
+    const columnSet = new Set()
+    const valueSet  = new Set()
+    for (const sample of textSamples.slice(0, 60)) {
+      // Pipe-delimited key-value rows produced by extractSpreadsheet
+      const pairs = sample.split('|').map(s => s.trim())
+      for (const pair of pairs) {
+        const colonIdx = pair.indexOf(':')
+        if (colonIdx > 0) {
+          const key = pair.slice(0, colonIdx).trim()
+          const val = pair.slice(colonIdx + 1).trim()
+          if (key && key.length < 80)  columnSet.add(key)
+          if (val && val.length < 120) valueSet.add(val)
+        }
+      }
+    }
+    schema.columns      = [...columnSet].slice(0, 30)
+    schema.sampleValues = [...valueSet].slice(0, 20)
+  } else {
+    // For prose/text/code docs extract keyword topics (longest unique words)
+    const freq = {}
+    for (const sample of textSamples.slice(0, 30)) {
+      for (const word of sample.toLowerCase().replace(/[^\w\s]/g, ' ').split(/\s+/)) {
+        if (word.length > 5) freq[word] = (freq[word] || 0) + 1
+      }
+    }
+    schema.topics = Object.entries(freq)
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 15)
+      .map(([w]) => w)
+  }
+
+  return schema
+}
+function buildDynamicSystemPrompt(hits) {
+  // Group text samples by source file
+  const fileMap = new Map()
+  for (const h of hits) {
+    const src = h.source_file || 'unknown'
+    if (!fileMap.has(src)) fileMap.set(src, [])
+    fileMap.get(src).push((h.text || '').trim())
+  }
+
+  // Infer a schema for every file
+  const schemas = []
+  for (const [fileName, samples] of fileMap) {
+    schemas.push(inferSchema(fileName, samples))
+  }
+
+  // Partition schemas by type for targeted instructions
+  const spreadsheets  = schemas.filter(s => s.type === DOC_TYPE.SPREADSHEET)
+  const dataFiles     = schemas.filter(s => s.type === DOC_TYPE.DATA)
+  const pdfDocs       = schemas.filter(s => s.type === DOC_TYPE.PDF)
+  const wordDocs      = schemas.filter(s => s.type === DOC_TYPE.WORD)
+  const presentations = schemas.filter(s => s.type === DOC_TYPE.PRESENTATION)
+  const codeFiles     = schemas.filter(s => s.type === DOC_TYPE.CODE)
+  const textFiles     = schemas.filter(s => s.type === DOC_TYPE.TEXT)
+  const emailFiles    = schemas.filter(s => s.type === DOC_TYPE.EMAIL)
+  const webFiles      = schemas.filter(s => s.type === DOC_TYPE.WEB)
+
+  // ── Base instructions (always included) ────────────────────────────────────
+  const base = `You are a knowledgeable business document assistant. Your task is to answer questions accurately using ONLY the document context provided below.
+
+UNIVERSAL RULES — apply to every response:
+1. Answer only from the context. Do not invent, assume, or hallucinate information.
+2. Search the entire context carefully before concluding something is absent.
+3. If a term, value, or concept appears ANYWHERE in the context — as a value, label, heading, or inline text — treat it as present and explain it.
+4. Case-insensitive matching: "gl activity", "GL Activity", "GL ACTIVITY" are identical.
+5. Never say "the context does not define", "not mentioned in the context", or similar refusals if the term appears anywhere.
+6. If after thorough search the information truly is absent, say: "I couldn't find specific information about that in your documents."
+7. Do NOT add citation numbers like [1], [2], [3].
+8. Do NOT mention file names or source documents in your answer.
+9. Write like a knowledgeable human colleague — clear, direct, and concise.
+10. Answer only what was asked. Avoid padding.`
+
+  // ── Type-specific instructions ─────────────────────────────────────────────
+  const typeBlocks = []
+
+  if (spreadsheets.length > 0) {
+    const colSummary = spreadsheets
+      .filter(s => s.columns.length > 0)
+      .map(s => `  • ${s.fileName}: columns include [${s.columns.join(', ')}]`)
+      .join('\n')
+
+    typeBlocks.push(`
+SPREADSHEET DATA RULES:
+- Context contains tabular/spreadsheet data serialised as pipe-delimited key-value rows, e.g.:
+    "ColumnA: ValueX | ColumnB: ValueY | ColumnC: ValueZ"
+- Each line represents ONE record (row). Every value on that line is real data — not a placeholder.
+- If asked about a term, scan ALL rows for that term appearing as any value or key.
+- "described as" lines (e.g., "GL Activity is described as: ...") are auto-generated summaries — trust them.
+- Synthesise across multiple matching rows when relevant; do not stop at the first hit.
+${colSummary ? `- Detected schema:\n${colSummary}` : ''}`)
+  }
+
+  if (dataFiles.length > 0) {
+    typeBlocks.push(`
+STRUCTURED DATA FILES (JSON / YAML / CSV / TSV) RULES:
+- Context may contain structured records from JSON, YAML, or flat files.
+- Fields and values may be nested. Read key paths like "parent.child: value" as nested attributes.
+- Treat every key and every value as meaningful data; do not require prose definitions.`)
+  }
+
+  if (pdfDocs.length > 0) {
+    typeBlocks.push(`
+PDF / SCANNED DOCUMENT RULES:
+- Content was extracted from PDF pages. Formatting artefacts (odd spacing, broken words) may exist.
+- Read numbers, dates, and figures carefully — they appear exactly as in the source.
+- Tables extracted from PDFs appear as space-separated text; infer column alignment from context.`)
+  }
+
+  if (wordDocs.length > 0) {
+    typeBlocks.push(`
+WORD DOCUMENT RULES:
+- Context contains prose paragraphs, lists, and potentially tables from Word files.
+- Headings and sub-headings are preserved — use them to understand document structure.
+- If a definition or policy statement is in the text, quote it accurately.`)
+  }
+
+  if (presentations.length > 0) {
+    typeBlocks.push(`
+PRESENTATION RULES:
+- Context contains slide content: titles, bullet points, and speaker notes.
+- Each slide title acts as a section header; bullets under it are supporting detail.
+- Do not infer more than what the slide explicitly states.`)
+  }
+
+  if (codeFiles.length > 0) {
+    typeBlocks.push(`
+CODE / SCRIPT RULES:
+- Context contains source code. Read it literally — function names, variable names, and comments are all meaningful.
+- When explaining code, describe what it does in plain English unless the user asks for code output.
+- If asked about a function or variable, find its definition and usage in the context.`)
+  }
+
+  if (textFiles.length > 0) {
+    typeBlocks.push(`
+TEXT / MARKDOWN DOCUMENT RULES:
+- Context contains plain text or Markdown documents.
+- Markdown formatting (##, **, -, etc.) is used for structure — interpret it accordingly.
+- Lists and numbered items represent discrete facts or steps; treat them individually.`)
+  }
+
+  if (emailFiles.length > 0) {
+    typeBlocks.push(`
+EMAIL RULES:
+- Context contains email content including Subject, From, To, Date, and body text.
+- Attribute statements accurately to their sender; do not mix up correspondents.
+- Dates and times are as stated in the email header.`)
+  }
+
+  if (webFiles.length > 0) {
+    typeBlocks.push(`
+WEB / HTML DOCUMENT RULES:
+- Context was extracted from HTML or XML. Navigation menus and boilerplate may be mixed with content.
+- Focus on the main body content; ignore repetitive navigation text.
+- Links are referenced by their anchor text — if a URL is mentioned, include it exactly.`)
+  }
+
+  // ── Mixed-document note ────────────────────────────────────────────────────
+  const uniqueTypes = [...new Set(schemas.map(s => s.type))]
+  const mixedNote = uniqueTypes.length > 1
+    ? `\nMIXED DOCUMENT SET: The context contains ${uniqueTypes.length} different document types (${uniqueTypes.join(', ')}). Apply the relevant rules above for each excerpt based on its source type. When synthesising an answer that spans multiple document types, clearly integrate the information.`
+    : ''
+
+  return [base, ...typeBlocks, mixedNote].filter(Boolean).join('\n') + '\n'
+}
 
 // ─── DB connections ───────────────────────────────────────────────────────────
 let db = null
@@ -126,8 +301,8 @@ async function getChatDb() {
 }
 
 // ─── Client cache ─────────────────────────────────────────────────────────────
-const CLIENT_CACHE  = new Map()
-const CACHE_TTL_MS  = 5 * 60 * 1000   // 5 min — intentionally shorter than the health-check interval
+const CLIENT_CACHE = new Map()
+const CACHE_TTL_MS = 5 * 60 * 1000
 
 function getCached(apiKey) {
   const entry = CLIENT_CACHE.get(apiKey)
@@ -137,22 +312,17 @@ function getCached(apiKey) {
 }
 function setCache(apiKey, data) { CLIENT_CACHE.set(apiKey, { ...data, cachedAt: Date.now() }) }
 function evictCache(apiKey) { if (apiKey) CLIENT_CACHE.delete(apiKey) }
+
 async function verifyApiKey(apiKey) {
   if (!apiKey || !apiKey.startsWith('rak_')) return null
-
-  // Fast path: cache hit (TTL-bounded so revoked keys are detected within CACHE_TTL_MS)
   const cached = getCached(apiKey)
   if (cached) return { clientId: cached.clientId, name: cached.name }
-
-  // Slow path: database lookup
   const database = await getDb()
   const client = await database.collection('clients').findOne(
     { apiKey },
     { projection: { clientId: 1, name: 1, _id: 0 } }
   )
   if (!client) return null
-
-  // Re-cache only on success — an invalid key should never be cached
   setCache(apiKey, { clientId: client.clientId, name: client.name })
   return { clientId: client.clientId, name: client.name }
 }
@@ -162,27 +332,19 @@ function startApiKeyHealthChecker() {
     console.warn('[healthChecker] MONGODB_URI not set — health checker disabled')
     return
   }
-
   console.log(`[healthChecker] Starting — polling every ${KEY_CHECK_INTERVAL_MS / 1000}s`)
-
   setInterval(async () => {
     const keys = [...CLIENT_CACHE.keys()]
     if (keys.length === 0) return
-
     console.log(`[healthChecker] Checking ${keys.length} cached key(s)`)
     let evicted = 0
-
     try {
       const database = await getDb()
       const col = database.collection('clients')
-
-      // Batch: fetch all matching keys in one round-trip
       const validDocs = await col
         .find({ apiKey: { $in: keys } }, { projection: { apiKey: 1, _id: 0 } })
         .toArray()
-
       const validSet = new Set(validDocs.map(d => d.apiKey))
-
       for (const key of keys) {
         if (!validSet.has(key)) {
           evictCache(key)
@@ -190,12 +352,8 @@ function startApiKeyHealthChecker() {
           console.log(`[healthChecker] Evicted revoked key: ${key.slice(0, 10)}…`)
         }
       }
-
-      if (evicted > 0) {
-        console.log(`[healthChecker] Evicted ${evicted} revoked key(s)`)
-      }
+      if (evicted > 0) console.log(`[healthChecker] Evicted ${evicted} revoked key(s)`)
     } catch (err) {
-      // Non-fatal: log and continue. The per-request verifyApiKey is the safety net.
       console.error('[healthChecker] Poll failed:', err.message)
     }
   }, KEY_CHECK_INTERVAL_MS)
@@ -208,13 +366,10 @@ function extractApiKey(req) {
 }
 
 async function requireClientKey(req, res, next) {
-  // Accept key from Authorization header (primary) or request body (fallback for PBI Desktop)
   const apiKey = extractApiKey(req) || req.body?.apiKey
   if (!apiKey) return res.status(401).json({ error: 'Missing API key' })
-
   const client = await verifyApiKey(apiKey)
   if (!client) return res.status(401).json({ error: 'Invalid or expired API key' })
-
   req.client = client
   next()
 }
@@ -228,14 +383,13 @@ function requireAdminKey(req, res, next) {
 
 // ─── Health ───────────────────────────────────────────────────────────────────
 app.get('/health', (req, res) => res.json({ ok: true, service: 'rag-client-auth' }))
+
 app.post('/client/verify', async (req, res) => {
   try {
     const apiKey = extractApiKey(req) || req.body?.apiKey
     if (!apiKey) return res.status(400).json({ valid: false, error: 'apiKey is required' })
-
     const client = await verifyApiKey(apiKey)
     if (!client) return res.status(401).json({ valid: false, error: 'Invalid or expired API key' })
-
     res.json({ valid: true, client })
   } catch (err) {
     console.error('POST /client/verify:', err)
@@ -328,10 +482,7 @@ app.delete('/admin/clients/:clientId', requireAdminKey, async (req, res) => {
     const database = await getDb()
     const client = await database.collection('clients').findOne({ clientId })
     if (!client) return res.status(404).json({ error: 'Client not found' })
-
-    // Evict cache immediately so the key stops working at once
     if (client.apiKey) evictCache(client.apiKey)
-
     await database.collection('clients').deleteOne({ clientId })
 
     const blobsDeleted = [], blobsFailed = []
@@ -364,13 +515,10 @@ app.delete('/admin/clients/:clientId', requireAdminKey, async (req, res) => {
 // ─── Client auth routes ───────────────────────────────────────────────────────
 app.post('/client/login', async (req, res) => {
   try {
-    // Accept key from Authorization header (PBI Desktop WebView2) or body (web)
     const apiKey = extractApiKey(req) || req.body?.apiKey
     if (!apiKey) return res.status(400).json({ error: 'apiKey is required' })
-
     const client = await verifyApiKey(apiKey)
     if (!client) return res.status(401).json({ error: 'Invalid API key' })
-
     res.json({ ok: true, client })
   } catch (err) {
     console.error('POST /client/login:', err)
@@ -378,15 +526,12 @@ app.post('/client/login', async (req, res) => {
   }
 })
 
-// Alias used by ChatApp.tsx
 app.post('/chat/login', async (req, res) => {
   try {
     const apiKey = extractApiKey(req) || req.body?.apiKey
     if (!apiKey) return res.status(400).json({ error: 'apiKey is required' })
-
     const client = await verifyApiKey(apiKey)
     if (!client) return res.status(401).json({ error: 'Invalid API key' })
-
     res.json({ ok: true, client })
   } catch (err) {
     console.error('POST /chat/login:', err)
@@ -715,14 +860,41 @@ function cosineSim(a, b) {
   return dot / (Math.sqrt(normA) * Math.sqrt(normB) + 1e-9)
 }
 
+/**
+ * Keyword search with type-aware scoring boosts.
+ * Spreadsheet chunks get a bonus when a whole phrase matches a key-value pair,
+ * since exact field matches are highly relevant for tabular data.
+ */
 function keywordSearch(query, chunks, topK) {
   const words = query.toLowerCase().replace(/[^\w\s]/g, ' ').split(/\s+/).filter(w => w.length > 1)
+  const queryLower = query.toLowerCase()
+
   return chunks
     .map(c => {
       const chunkLower  = (c.text || '').toLowerCase()
-      const score       = words.reduce((acc, w) => acc + (chunkLower.includes(w) ? 1 : 0), 0)
-      const phraseBonus = chunkLower.includes(query.toLowerCase()) ? words.length : 0
-      return { ...c, _score: score + phraseBonus }
+      const docType     = classifyExtension(c.source_file || '')
+
+      // Base word coverage score
+      const wordScore   = words.reduce((acc, w) => acc + (chunkLower.includes(w) ? 1 : 0), 0)
+
+      // Phrase bonus — higher weight for spreadsheet/data chunks where exact matches matter more
+      const phraseFound = chunkLower.includes(queryLower)
+      const phraseBonus = phraseFound
+        ? (docType === DOC_TYPE.SPREADSHEET || docType === DOC_TYPE.DATA)
+          ? words.length * 2   // double bonus for structured data
+          : words.length
+        : 0
+
+      // Key-value pair bonus: query term appears as a value in a pipe-delimited row
+      const kvBonus = (docType === DOC_TYPE.SPREADSHEET || docType === DOC_TYPE.DATA)
+        ? words.reduce((acc, w) => {
+            // Matches patterns like "SomeKey: <word>" or "| <word> |"
+            const kvPattern = new RegExp(`:\\s*${w}\\b|\\|\\s*${w}\\b`, 'i')
+            return acc + (kvPattern.test(c.text || '') ? 2 : 0)
+          }, 0)
+        : 0
+
+      return { ...c, _score: wordScore + phraseBonus + kvBonus }
     })
     .filter(c => c._score > 0)
     .sort((a, b) => b._score - a._score)
@@ -749,7 +921,10 @@ async function retrieveChunks(query, chunks, topK = 6) {
         try {
           const chunkTextNorm = (c.text || '').toLowerCase()
           const r = await ai.models.embedContent({ model: 'text-embedding-004', contents: chunkTextNorm })
-          scored.push({ ...c, _score: cosineSim(queryVec, r.embeddings[0].values) })
+          // Blend semantic similarity with keyword score (70/30)
+          const semanticScore = cosineSim(queryVec, r.embeddings[0].values)
+          const keywordScore  = typeof c._score === 'number' ? c._score / (words_in(normalizedQuery) * 5 || 1) : 0
+          scored.push({ ...c, _score: semanticScore * 0.7 + keywordScore * 0.3 })
         } catch {
           scored.push({ ...c, _score: c._score || 0 })
         }
@@ -762,28 +937,57 @@ async function retrieveChunks(query, chunks, topK = 6) {
   return pool.slice(0, Math.min(topK, 20))
 }
 
+/** Small helper used inside retrieveChunks */
+function words_in(str) {
+  return str.split(/\s+/).filter(Boolean).length
+}
+
+/**
+ * Builds the context string passed to the LLM.
+ * Each excerpt is tagged with its document type so the model
+ * can apply the correct reading strategy from the dynamic prompt.
+ */
 function buildContext(hits) {
   return hits.map((h, i) => {
-    const src = h.source_file || 'document'
-    const isSpreadsheet = /\.(xlsx|xls|ods|csv|tsv)$/i.test(src)
-    const hint = isSpreadsheet
-      ? '(spreadsheet data — each line is a record row; terms appearing as values are real data items)'
-      : '(document excerpt)'
-    return `[Excerpt ${i + 1} from ${src} ${hint}]\n${(h.text || '').trim()}`
+    const src     = h.source_file || 'document'
+    const docType = classifyExtension(src)
+
+    const typeLabel = {
+      [DOC_TYPE.SPREADSHEET]:  'spreadsheet — each line is a record; pipe-separated key:value pairs',
+      [DOC_TYPE.DATA]:         'structured data — JSON/YAML/CSV record',
+      [DOC_TYPE.PDF]:          'PDF document excerpt',
+      [DOC_TYPE.WORD]:         'Word document excerpt',
+      [DOC_TYPE.PRESENTATION]: 'presentation slide content',
+      [DOC_TYPE.CODE]:         'source code',
+      [DOC_TYPE.TEXT]:         'text/markdown document',
+      [DOC_TYPE.EMAIL]:        'email content',
+      [DOC_TYPE.WEB]:          'web/HTML page content',
+      [DOC_TYPE.UNKNOWN]:      'document excerpt',
+    }[docType] || 'document excerpt'
+
+    return `[Excerpt ${i + 1} | type: ${typeLabel}]\n${(h.text || '').trim()}`
   }).join('\n\n')
 }
 
-async function answerWithGemini(originalQuery, normalizedQuery, context) {
+/**
+ * Calls Gemini with a DYNAMIC system prompt built from the retrieved hits.
+ * The prompt is generated fresh for every request, reflecting the exact
+ * document types and inferred schemas present in the context window.
+ */
+async function answerWithGemini(originalQuery, normalizedQuery, context, hits) {
   const ai = new GoogleGenAI({ apiKey: GEMINI_API_KEY })
-  const prompt = `${SYSTEM_PROMPT}
 
+  // Build prompt dynamically from retrieved chunks
+  const dynamicSystemPrompt = buildDynamicSystemPrompt(hits)
+
+  const prompt = `${dynamicSystemPrompt}
 ---DOCUMENT CONTEXT START---
 ${context}
 ---DOCUMENT CONTEXT END---
 
 The user is asking: "${originalQuery}"
 
-Before answering, scan the entire context above for any occurrence of the key terms in the question (case-insensitive). If you find it anywhere — as a row value, column value, label, or text — explain what the context says about it in plain English. Do not say it is missing if it appears anywhere in the data above.`
+Before answering, scan the entire context above for any occurrence of the key terms in the question (case-insensitive). Apply the document-type rules above to interpret each excerpt correctly. Synthesise a clear, direct answer in plain English. Do not say a term is missing if it appears anywhere in the data above.`
 
   const res = await ai.models.generateContent({
     model: 'gemini-2.5-flash',
@@ -824,7 +1028,8 @@ app.post('/chat/message', requireClientKey, async (req, res) => {
       })
     }
 
-    const answer = await answerWithGemini(query.trim(), normalizedQuery, buildContext(hits))
+    // Pass hits to answerWithGemini so the dynamic prompt can inspect them
+    const answer = await answerWithGemini(query.trim(), normalizedQuery, buildContext(hits), hits)
     const sources = hits.map(h => ({
       source_file:  h.source_file || 'unknown',
       chunk_index:  h.chunk_index ?? 0,
