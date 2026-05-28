@@ -1940,16 +1940,12 @@ app.get('/health', (req, res) => res.json({
 ok: true,
 service: 'ask-data',
 engines: { primary: ASKDATA_ENDPOINT ? 'configured' : 'missing', fallback: ASKDATA2_ENDPOINT ? 'configured' : 'missing' },
-embeddings: 'keyword-bm25-hybrid (no external API)',
-reranker: 'lightweight-in-code',
+embeddings: 'Keyword+BM25+NLP+MiniLM-L6 (hybrid)',
+reranker: 'lightweight-in-code + cross-encoder',
 chunkCacheSize: CHUNK_CACHE.size,
 responseCacheSize: RESPONSE_CACHE.size,
 primaryCircuitOpen: askedataCircuitOpen(),
 primaryFailures: askedataFailures,
-maxHits: MAX_HITS_GLOBAL,
-supportedExtensions: [...SUPPORTED_EXTENSIONS],
-docTypes: ['dictionary', 'policy', 'research', 'mixed'],
-chunkSizes: { dictionary: CHUNK_SIZE, policy: POLICY_CHUNK_SIZE, research: RESEARCH_CHUNK_SIZE },
 }))
 app.post('/client/verify', async (req, res) => {
 try {
