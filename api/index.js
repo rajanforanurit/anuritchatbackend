@@ -2214,14 +2214,18 @@ app.use((err, req, res, next) => {
 console.error('[global error handler]', err)
 if (!res.headersSent) res.status(500).json({ error: 'An unexpected error occurred. Please try again.' })
 })
-const PORT = process.env.PORT || 4000
-app.listen(PORT, () => {
-console.log(`Service running on port ${PORT}`)
-console.log(`ASKDATA: ${ASKDATA_ENDPOINT ? 'configured' : 'MISSING'} | ASKDATA2: ${ASKDATA2_ENDPOINT ? 'configured' : 'missing'}`)
-console.log(`Embeddings: keyword-BM25-hybrid (no external API) | Reranker: in-code lightweight | MAX_HITS: ${MAX_HITS_GLOBAL}`)
-console.log(`Chunk sizes: dictionary=${CHUNK_SIZE} | policy=${POLICY_CHUNK_SIZE} | research=${RESEARCH_CHUNK_SIZE}`)
-console.log(`Supported formats: ${[...SUPPORTED_EXTENSIONS].join(', ')}`)
-startApiKeyHealthChecker()
-warmupChunkCaches()
-})
-module.exports = app
+if (process.env.VERCEL !== '1') {
+    const PORT = process.env.PORT || 4000;
+    app.listen(PORT, () => {
+        console.log(`✅ Service running on port ${PORT}`);
+        console.log(`ASKDATA: ${ASKDATA_ENDPOINT ? 'configured' : 'MISSING'} | ASKDATA2: ${ASKDATA2_ENDPOINT ? 'configured' : 'missing'}`);
+        console.log(`Embeddings: keyword-BM25-hybrid (no external API) | Reranker: in-code lightweight | MAX_HITS: ${MAX_HITS_GLOBAL}`);
+        console.log(`Chunk sizes: dictionary=${CHUNK_SIZE} | policy=${POLICY_CHUNK_SIZE} | research=${RESEARCH_CHUNK_SIZE}`);
+        console.log(`Supported formats: ${[...SUPPORTED_EXTENSIONS].join(', ')}`);
+        startApiKeyHealthChecker();
+        warmupChunkCaches();
+    });
+} else {
+    console.log(`🚀 Running on Vercel - Express app exported successfully`);
+}
+module.exports = app;
