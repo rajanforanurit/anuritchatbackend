@@ -72,6 +72,8 @@ const RESEARCH_CHUNK_OVERLAP = 100
 const BLOB_CONCURRENCY = parseInt(process.env.BLOB_CONCURRENCY || '8', 10)
 const CHUNK_CACHE_TTL = parseInt(process.env.CHUNK_CACHE_TTL_MS || '300000', 10)
 const MAX_HITS_GLOBAL = 50
+const RELATED_KEYWORDS_COUNT = 5
+const RELATED_KEYWORDS_MIN_SCORE = 1
 const blobServiceClient = AZURE_CONNECTION_STRING
 ? BlobServiceClient.fromConnectionString(AZURE_CONNECTION_STRING)
 : null
@@ -410,7 +412,23 @@ if (!text || text.length <= maxLen) return text
 const truncated = text.slice(0, maxLen)
 const lastPeriod = Math.max(truncated.lastIndexOf('. '), truncated.lastIndexOf('.\n'), truncated.lastIndexOf('.'))
 if (lastPeriod > maxLen * 0.5) return truncated.slice(0, lastPeriod + 1).trim()
+const lastSpace = truncated.lastIndexOf(' ')
+if (lastSpace > maxLen * 0.7) return truncated.slice(0, lastSpace).trim()
 return truncated.trim()
+}
+function trimPreviewToSentence(text, maxLen = 300) {
+if (!text || text.length <= maxLen) return text.trim()
+const truncated = text.slice(0, maxLen)
+const sentenceEnd = Math.max(
+truncated.lastIndexOf('. '),
+truncated.lastIndexOf('.\n'),
+truncated.lastIndexOf('! '),
+truncated.lastIndexOf('? ')
+)
+if (sentenceEnd > maxLen * 0.4) return truncated.slice(0, sentenceEnd + 1).trim()
+const lastSpace = truncated.lastIndexOf(' ')
+if (lastSpace > maxLen * 0.6) return truncated.slice(0, lastSpace).trim() + '…'
+return truncated.trim() + '…'
 }
 function ensureSinglePeriod(text) {
 if (!text) return ''
@@ -782,29 +800,55 @@ if (additionalVal) synthesis += `. Additional Info: ${additionalVal}`
 if (urlVal) synthesis += `. URL: ${urlVal}`
 rows.push({
 text: synthesis,
-metadata: { measure: nameVal, table: tableVal || sheetName, formula: formulaVal || '', description: descVal || '', url: urlVal || '', sourceSheet: sheetName }
+metadata: {
+measure: nameVal,
+table: tableVal || sheetName,
+formula: formulaVal || '',
+description: descVal || '',
+url: urlVal || '',
+sourceSheet: sheetName,
+_expansionRow: false,
+}
 })
 if (formulaVal) {
-rows.push({ text: `How to calculate ${nameVal}: ${formulaVal}`, metadata: { measure: nameVal, table: tableVal || sheetName, formula: formulaVal, description: descVal || '', url: '', sourceSheet: sheetName } })
-rows.push({ text: `Formula for ${nameVal}: ${formulaVal}`, metadata: { measure: nameVal, table: tableVal || sheetName, formula: formulaVal, description: descVal || '', url: '', sourceSheet: sheetName } })
+rows.push({
+text: `How to calculate ${nameVal}: ${formulaVal}`,
+metadata: { measure: nameVal, table: tableVal || sheetName, formula: formulaVal, description: descVal || '', url: '', sourceSheet: sheetName, _expansionRow: true }
+})
+rows.push({
+text: `Formula for ${nameVal}: ${formulaVal}`,
+metadata: { measure: nameVal, table: tableVal || sheetName, formula: formulaVal, description: descVal || '', url: '', sourceSheet: sheetName, _expansionRow: true }
+})
 }
 if (urlVal) {
-rows.push({ text: `Report URL for ${nameVal}: ${urlVal}`, metadata: { measure: nameVal, table: tableVal || sheetName, formula: '', description: '', url: urlVal, sourceSheet: sheetName } })
-rows.push({ text: `Power BI link for ${nameVal}: ${urlVal}`, metadata: { measure: nameVal, table: tableVal || sheetName, formula: '', description: '', url: urlVal, sourceSheet: sheetName } })
+rows.push({
+text: `Report URL for ${nameVal}: ${urlVal}`,
+metadata: { measure: nameVal, table: tableVal || sheetName, formula: '', description: '', url: urlVal, sourceSheet: sheetName, _expansionRow: true }
+})
+rows.push({
+text: `Power BI link for ${nameVal}: ${urlVal}`,
+metadata: { measure: nameVal, table: tableVal || sheetName, formula: '', description: '', url: urlVal, sourceSheet: sheetName, _expansionRow: true }
+})
 if (tableVal && tableVal !== sheetName) {
-rows.push({ text: `Report URL for ${nameVal} (${tableVal}): ${urlVal}`, metadata: { measure: nameVal, table: tableVal, formula: '', description: '', url: urlVal, sourceSheet: sheetName } })
+rows.push({
+text: `Report URL for ${nameVal} (${tableVal}): ${urlVal}`,
+metadata: { measure: nameVal, table: tableVal, formula: '', description: '', url: urlVal, sourceSheet: sheetName, _expansionRow: true }
+})
 }
 }
 rowsEmitted++
 } else if (descVal) {
-rows.push({ text: descVal, metadata: { measure: '', table: tableVal || sheetName, formula: '', description: descVal, url: '', sourceSheet: sheetName } })
+rows.push({
+text: descVal,
+metadata: { measure: '', table: tableVal || sheetName, formula: '', description: descVal, url: '', sourceSheet: sheetName, _expansionRow: false }
+})
 }
 }
 if (rowsEmitted === 0) {
 for (let i = headerRowIdx + 1; i < rawRows.length; i++) {
 const row = rawRows[i]
 const cells = row.map(c => String(c || '').trim()).filter(Boolean)
-if (cells.length) rows.push({ text: cells.join(' | '), metadata: { measure: '', table: sheetName, formula: '', description: '', url: '', sourceSheet: sheetName } })
+if (cells.length) rows.push({ text: cells.join(' | '), metadata: { measure: '', table: sheetName, formula: '', description: '', url: '', sourceSheet: sheetName, _expansionRow: false } })
 }
 }
 }
@@ -943,6 +987,68 @@ const penalty = computeNegativePenalty(subject, c.text || '')
 return { ...c, _score: Math.max(0, matched + subjectMatch + metaBoost - penalty) }
 }).filter(c => c._score > 0).sort((a, b) => b._score - a._score).slice(0, topK)
 }
+function computeKeywordRelevanceScore(subjectWords, chunk) {
+const measure = (chunk.metadata && chunk.metadata.measure ? chunk.metadata.measure : '').toLowerCase()
+const desc = (chunk.metadata && chunk.metadata.description ? chunk.metadata.description : '').toLowerCase()
+const text = (chunk.text || '').toLowerCase()
+const subjectPhrase = subjectWords.join(' ')
+if (measure === subjectPhrase) return 0
+let score = 0
+const measureWordMatches = subjectWords.filter(w => new RegExp(`\\b${escapeRegex(w)}\\b`, 'i').test(measure)).length
+score += measureWordMatches * 15
+const allSubjectWordsInMeasure = subjectWords.every(w => new RegExp(`\\b${escapeRegex(w)}\\b`, 'i').test(measure))
+if (allSubjectWordsInMeasure && measure !== subjectPhrase) score += 20
+const descWordMatches = subjectWords.filter(w => new RegExp(`\\b${escapeRegex(w)}\\b`, 'i').test(desc)).length
+score += descWordMatches * 3
+const textWordMatches = subjectWords.filter(w => new RegExp(`\\b${escapeRegex(w)}\\b`, 'i').test(text)).length
+score += textWordMatches * 1
+return score
+}
+function buildRelatedKeywords(subject, hits, chunks, invertedIndex, topN = RELATED_KEYWORDS_COUNT) {
+const subjectLower = subject.toLowerCase().trim()
+const subjectWords = subjectLower.replace(/[^\w\s]/g, ' ').split(/\s+/).filter(w => w.length > 2)
+if (subjectWords.length === 0) return []
+const primaryHitKeys = new Set(hits.map(h => (h.metadata && h.metadata.measure ? h.metadata.measure.toLowerCase().trim() : null)).filter(Boolean))
+const candidateMap = new Map()
+const seenMeasures = new Set()
+seenMeasures.add(subjectLower)
+for (const chunk of chunks) {
+if (!chunk.metadata || !chunk.metadata.measure) continue
+if (chunk.metadata._expansionRow) continue
+const measureName = chunk.metadata.measure.trim()
+const measureLower = measureName.toLowerCase()
+if (seenMeasures.has(measureLower)) continue
+seenMeasures.add(measureLower)
+const score = computeKeywordRelevanceScore(subjectWords, chunk)
+if (score < RELATED_KEYWORDS_MIN_SCORE) continue
+const existing = candidateMap.get(measureLower)
+if (!existing || score > existing.score) {
+candidateMap.set(measureLower, {
+keyword: measureName,
+score,
+table: chunk.metadata.table || '',
+description: chunk.metadata.description || '',
+formula: chunk.metadata.formula || '',
+isPrimaryHit: primaryHitKeys.has(measureLower),
+})
+}
+}
+const sorted = [...candidateMap.values()]
+.sort((a, b) => {
+if (b.isPrimaryHit !== a.isPrimaryHit) return b.isPrimaryHit ? 1 : -1
+return b.score - a.score
+})
+.slice(0, topN)
+const maxScore = sorted.length > 0 ? sorted[0].score : 1
+return sorted.map(item => ({
+keyword: item.keyword,
+table: item.table,
+description: item.description ? trimPreviewToSentence(item.description, 120) : '',
+formula: item.formula ? trimPreviewToSentence(item.formula, 100) : '',
+confidenceScore: Math.min(100, Math.round((item.score / Math.max(maxScore, 1)) * 100)),
+isPrimaryHit: item.isPrimaryHit,
+}))
+}
 async function retrieveChunks(query, chunks, topK, invertedIndex, docType, _isRetry = false) {
 const intent = detectQueryIntent(query)
 const isPolicyIntent = ['policy_lookup', 'policy_consequence', 'policy_permission', 'policy_numeric'].includes(intent)
@@ -981,6 +1087,7 @@ function buildContext(hits) {
 const seen = new Set()
 const deduped = []
 for (const h of hits) {
+if (h.metadata && h.metadata._expansionRow) continue
 const fp = (h.text || '').trim().slice(0, 80).toLowerCase()
 if (!seen.has(fp)) { seen.add(fp); deduped.push(h) }
 if (deduped.length >= 8) break
@@ -1941,6 +2048,31 @@ console.warn('[saveConversationMessage] Failed:', saveErr.message)
 return conversationId || null
 }
 }
+function buildDedupedSources(hits) {
+const seenKeys = new Set()
+const result = []
+for (const h of hits) {
+if (h.metadata && h.metadata._expansionRow) continue
+const measureKey = h.metadata && h.metadata.measure ? h.metadata.measure.toLowerCase().trim() : null
+const urlKey = h.metadata && h.metadata.url ? h.metadata.url.toLowerCase().trim() : null
+const dedupeKey = measureKey
+? `measure:${measureKey}`
+: urlKey
+? `url:${urlKey}`
+: `text:${(h.text || '').trim().slice(0, 80).toLowerCase()}`
+if (seenKeys.has(dedupeKey)) continue
+seenKeys.add(dedupeKey)
+result.push({
+source_file: h.source_file || 'unknown',
+chunk_index: h.chunk_index ?? 0,
+score: typeof h._score === 'number' ? parseFloat(h._score.toFixed(4)) : null,
+measure: h.metadata && h.metadata.measure ? h.metadata.measure : null,
+table: h.metadata && h.metadata.table ? h.metadata.table : null,
+preview: trimPreviewToSentence(h.text || '', 300),
+})
+}
+return result
+}
 app.get('/health', (req, res) => res.json({
 ok: true,
 service: 'ask-data',
@@ -2139,10 +2271,10 @@ const { clientId, name } = req.client
 const intentResult = resolveIntent(query.trim())
 if (intentResult) {
 const activeConversationId = await saveConversationMessage(clientId, conversationId || null, query.trim(), intentResult.response, [])
-return res.json({ answer: intentResult.response, sources: [], conversationId: activeConversationId, client: { clientId, name } })
+return res.json({ answer: intentResult.response, sources: [], relatedKeywords: [], conversationId: activeConversationId, client: { clientId, name } })
 }
 const validation = validateQuery(query)
-if (!validation.valid) return res.json({ answer: validation.message, sources: [], conversationId: conversationId || null, client: { clientId, name } })
+if (!validation.valid) return res.json({ answer: validation.message, sources: [], relatedKeywords: [], conversationId: conversationId || null, client: { clientId, name } })
 const cacheKey = getCacheKey(clientId, query)
 const cached = responseCacheGet(cacheKey)
 if (cached) {
@@ -2159,7 +2291,7 @@ return res.json({ ...result, conversationId: activeConversationId })
 const requestPromise = (async () => {
 const { chunks, invertedIndex, docType } = await loadChunksForClient(clientId)
 if (chunks.length === 0) {
-return { answer: 'No documents found for your account. Please ensure your documents have been ingested first.', sources: [], client: { clientId, name } }
+return { answer: 'No documents found for your account. Please ensure your documents have been ingested first.', sources: [], relatedKeywords: [], client: { clientId, name } }
 }
 let processedQuery = applyTypos(query.trim())
 if (processedQuery !== query.trim()) console.log(`[QueryPipeline] After typos: "${processedQuery}"`)
@@ -2176,29 +2308,26 @@ if (effectiveIntent === 'all_urls') {
 const urlChunks = chunks.filter(c => /https?:\/\/\S+/.test(c.text || ''))
 const urlEntries = extractAllUrlsFromChunks(urlChunks)
 const answer = urlEntries.length > 0 ? urlEntries.map(e => `**${e.name}:** ${e.url}`).join('\n') : "I could not find any URLs in your documents."
-const sources = urlChunks.slice(0, 6).map(h => ({ source_file: h.source_file || 'unknown', chunk_index: h.chunk_index ?? 0, score: null, preview: (h.text || '').slice(0, 200) }))
-return { answer, sources, client: { clientId, name } }
+const sources = buildDedupedSources(urlChunks.slice(0, 6))
+return { answer, sources, relatedKeywords: [], client: { clientId, name } }
 }
 const multiTopicCheck = detectMultiTopicQuery(processedQuery)
 if (multiTopicCheck.isMulti) {
 console.log(`[chat/message] Multi-topic detected: ${JSON.stringify(multiTopicCheck.topics)} mode=${multiTopicCheck.mode}`)
 const answer = await handleMultiTopicQuery(multiTopicCheck.topics, multiTopicCheck.mode, chunks, Math.min(topK, MAX_HITS_GLOBAL), invertedIndex, effectiveDocType)
-return { answer, sources: [], client: { clientId, name } }
+return { answer, sources: [], relatedKeywords: [], client: { clientId, name } }
 }
 let hits = await retrieveChunks(processedQuery, chunks, Math.min(topK, MAX_HITS_GLOBAL), invertedIndex, effectiveDocType)
 if (hits.length === 0) hits = relaxedKeywordSearch(processedQuery, chunks, 64, invertedIndex)
 console.log(`[chat/message] "${query.slice(0, 60)}" -> intent=${effectiveIntent}, docType=${effectiveDocType}, subject="${extractSubject(processedQuery)}", hits=${hits.length}, topScore=${hits[0]?._score?.toFixed(2) || 0}`)
 if (hits.length === 0) {
-return { answer: "I could not find relevant information about this in your documents. Try rephrasing your question.", sources: [], client: { clientId, name } }
+return { answer: "I could not find relevant information about this in your documents. Try rephrasing your question.", sources: [], relatedKeywords: [], client: { clientId, name } }
 }
 const answer = await generateAnswerWithFallback(processedQuery, hits, effectiveIntent, effectiveDocType, chunks, invertedIndex, Math.min(topK, MAX_HITS_GLOBAL))
-const sources = hits.map(h => ({
-source_file: h.source_file || 'unknown',
-chunk_index: h.chunk_index ?? 0,
-score: typeof h._score === 'number' ? parseFloat(h._score.toFixed(4)) : null,
-preview: (h.text || '').slice(0, 200),
-}))
-return { answer, sources, client: { clientId, name } }
+const sources = buildDedupedSources(hits)
+const subject = extractSubject(processedQuery)
+const relatedKeywords = buildRelatedKeywords(subject, hits, chunks, invertedIndex, RELATED_KEYWORDS_COUNT)
+return { answer, sources, relatedKeywords, client: { clientId, name } }
 })()
 IN_FLIGHT.set(cacheKey, requestPromise)
 let result
