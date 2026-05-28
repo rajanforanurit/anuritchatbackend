@@ -2219,8 +2219,7 @@ if (process.env.VERCEL !== '1') {
     app.listen(PORT, () => {
         console.log(`✅ Service running on port ${PORT}`);
         console.log(`ASKDATA: ${ASKDATA_ENDPOINT ? 'configured' : 'MISSING'} | ASKDATA2: ${ASKDATA2_ENDPOINT ? 'configured' : 'missing'}`);
-        console.log(`Embeddings: keyword-BM25-hybrid (no external API) | Reranker: in-code lightweight | MAX_HITS: ${MAX_HITS_GLOBAL}`);
-        console.log(`Chunk sizes: dictionary=${CHUNK_SIZE} | policy=${POLICY_CHUNK_SIZE} | research=${RESEARCH_CHUNK_SIZE}`);
+        console.log(`Embeddings: keyword+BM25+NLP (hybrid) | Reranker: in-code lightweight+cross-encoder | MAX_HITS: ${MAX_HITS_GLOBAL}`);
         console.log(`Supported formats: ${[...SUPPORTED_EXTENSIONS].join(', ')}`);
         startApiKeyHealthChecker();
         warmupChunkCaches();
