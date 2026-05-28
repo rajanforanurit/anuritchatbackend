@@ -1,6 +1,6 @@
 {
-  "name": "rag-client-auth",
-  "version": "1.0.0",
+  "name": "Ask Data",
+  "version": "2.22.0",
   "description": "RAG Client Authentication + Chat API",
   "main": "api/index.js",
   "type": "commonjs",
@@ -13,7 +13,6 @@
   },
   "dependencies": {
     "@azure/storage-blob": "^12.17.0",
-    "@google/genai": "^0.11.0",
     "bcryptjs": "^2.4.3",
     "cors": "^2.8.5",
     "dotenv": "^16.4.5",
@@ -27,8 +26,8 @@
     "js-yaml": "^4.1.0",
     "papaparse": "^5.4.1",
     "mailparser": "^3.6.8",
-    "string-similarity": "^4.0.4",
-    "officeparser": "^4.0.0"
+    "officeparser": "^4.0.0",
+    "string-similarity": "^4.0.4" 
   },
   "devDependencies": {
     "nodemon": "^3.1.0"
