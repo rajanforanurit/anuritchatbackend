@@ -27,6 +27,7 @@
     "js-yaml": "^4.1.0",
     "papaparse": "^5.4.1",
     "mailparser": "^3.6.8",
+    "string-similarity": "^4.0.4",
     "officeparser": "^4.0.0"
   },
   "devDependencies": {
