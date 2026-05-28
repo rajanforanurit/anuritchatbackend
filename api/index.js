@@ -671,6 +671,10 @@ const headingTermMatches = queryTerms.filter(t => headingLower.includes(t)).leng
 rerankScore += headingTermMatches * 8
 }
 if (c.metadata.is_definition_chunk) rerankScore += (intent === 'definition' ? 12 : 0)
+if (c.metadata.measure) {
+const mL = (c.metadata.measure || '').toLowerCase().trim()
+if (mL === queryTerms.join(' ').trim()) rerankScore += 80
+}
 if (c.metadata.is_clause_chunk) rerankScore += (isPolicyQuery ? 12 : 0)
 if (c.metadata.is_research_section) rerankScore += (isResearchDoc ? 5 : 0)
 if (c.metadata.chunk_position === 'early' && (intent === 'definition' || intent === 'policy_lookup')) rerankScore += 3
@@ -680,7 +684,7 @@ if (queryPhraseRegex.test(text)) rerankScore += 8
 const sentenceCount = (text.match(/[.!?]+/g) || []).length
 if (sentenceCount >= 2 && sentenceCount <= 8) rerankScore += 3
 return { ...c, _rerankScore: rerankScore, _score: (c._score || 0) + rerankScore * 0.3 }
-}).sort((a, b) => b._rerankScore - a._rerankScore)
+}).sort((a, b) => (b._score - a._score) || (b._rerankScore - a._rerankScore))
 }
 function scoreHeaderMatch(header, patterns) {
 const h = header.toLowerCase().trim()
@@ -1233,7 +1237,7 @@ if (!new RegExp(`\\b${escapedSubject}\\b`, 'i').test(line)) continue
 if (line.trim().length <= 20) continue
 if ((line.match(/\|/g) || []).length > 2) continue
 if (/^===\s*Sheet:/.test(line.trim())) continue
-if (resolvedIntent === 'definition' && /formula|calculated as|computed as/i.test(line)) continue
+if (resolvedIntent === 'definition' && /formula|calculated as|computed as/i.test(line) && !/is defined as/i.test(line)) continue
 const cleaned = line.trim().replace(/\(from\s+[A-Za-z\s]+\)/g, '').trim()
 if (cleaned.length > 15) matchingLines.push(cleaned)
 }
@@ -2212,16 +2216,16 @@ console.error('[global error handler]', err)
 if (!res.headersSent) res.status(500).json({ error: 'An unexpected error occurred. Please try again.' })
 })
 if (process.env.VERCEL !== '1') {
-    const PORT = process.env.PORT || 4000;
-    app.listen(PORT, () => {
-        console.log(`✅ Service running on port ${PORT}`);
-        console.log(`ASKDATA: ${ASKDATA_ENDPOINT ? 'configured' : 'MISSING'} | ASKDATA2: ${ASKDATA2_ENDPOINT ? 'configured' : 'missing'}`);
-        console.log(`Embeddings: keyword+BM25+NLP (hybrid) | Reranker: in-code lightweight+cross-encoder | MAX_HITS: ${MAX_HITS_GLOBAL}`);
-        console.log(`Supported formats: ${[...SUPPORTED_EXTENSIONS].join(', ')}`);
-        startApiKeyHealthChecker();
-        warmupChunkCaches();
-    });
+const PORT = process.env.PORT || 4000;
+app.listen(PORT, () => {
+console.log(`✅ Service running on port ${PORT}`);
+console.log(`ASKDATA: ${ASKDATA_ENDPOINT ? 'configured' : 'MISSING'} | ASKDATA2: ${ASKDATA2_ENDPOINT ? 'configured' : 'missing'}`);
+console.log(`Embeddings: keyword+BM25+NLP (hybrid) | Reranker: in-code lightweight+cross-encoder | MAX_HITS: ${MAX_HITS_GLOBAL}`);
+console.log(`Supported formats: ${[...SUPPORTED_EXTENSIONS].join(', ')}`);
+startApiKeyHealthChecker();
+warmupChunkCaches();
+});
 } else {
-    console.log(`🚀 Running on Vercel - Express app exported successfully`);
+console.log(`🚀 Running on Vercel - Express app exported successfully`);
 }
 module.exports = app;
