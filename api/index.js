@@ -17,6 +17,7 @@ const allowedOrigins = [
 'https://app.powerbi.com',
 'https://msit.powerbi.com',
 'https://anuritchat.vercel.app',
+'https://askdatatest.vercel.app',
 'https://ragadminpanel.vercel.app',
 'https://df.powerbi.com',
 'https://www.anuritinnovation.com/',
