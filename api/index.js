@@ -228,7 +228,6 @@ function extractSubject(q) {
 }
 function extractMeasureSubject(q) {
   const raw = q.trim().replace(/[?!]+$/, '').trim()
-  const lower = raw.toLowerCase()
   const prefixes = [
     /^what\s+is\s+(?:the\s+)?/i,
     /^define\s+/i,
@@ -793,7 +792,6 @@ function buildDirectMeasureAnswer(q, hits, intent) {
   return null
 }
 function buildDirectPolicyAnswer(q, hits, intent) {
-  const measureSubject = extractMeasureSubject(q)
   const subject = extractSubject(q)
   const esc = escapeRegex(subject.toLowerCase())
   const focusSentences = hits
@@ -1516,6 +1514,54 @@ function buildRelatedKeywords(subject, hits, chunks, invertedIndex, topN=RELATED
   const max=sorted[0]?.score||1
   return sorted.map(item=>({keyword:item.keyword,table:item.table,description:item.description?trimPreviewToSentence(item.description,120):'',formula:item.formula?trimPreviewToSentence(item.formula,100):'',confidenceScore:Math.min(100,Math.round(item.score/Math.max(max,1)*100)),isPrimaryHit:item.isPrimary}))
 }
+function buildRelatedMetrics(subject, hits, chunks, topN=6) {
+  const hasMeasureData = chunks.some(c => c.metadata?.measure && !c.metadata._expansionRow)
+  if (!hasMeasureData) return []
+  const sl = subject.toLowerCase().trim()
+  const sw = sl.replace(/[^\w\s]/g, ' ').split(/\s+/).filter(w => w.length > 2)
+  if (!sw.length) return []
+  const primaryMeasures = new Set(
+    hits.filter(h => h.metadata?.measure && !h.metadata._expansionRow)
+        .map(h => h.metadata.measure.toLowerCase().trim())
+  )
+  const cands = new Map()
+  for (const c of chunks) {
+    if (!c.metadata?.measure || c.metadata._expansionRow) continue
+    const ml = c.metadata.measure.trim().toLowerCase()
+    if (primaryMeasures.has(ml)) continue
+    const desc = (c.metadata.description || '').toLowerCase()
+    let score = 0
+    for (const w of sw) {
+      const re = new RegExp(`\\b${escapeRegex(w)}\\b`, 'i')
+      if (re.test(ml)) score += 20
+      if (re.test(desc)) score += 5
+    }
+    if (score < 5) continue
+    const existing = cands.get(ml)
+    if (!existing || score > existing.score) {
+      const rawDesc = c.metadata.description || ''
+      const firstSentence = rawDesc.split(/\.\s+/)[0].trim()
+      const shortDescription = firstSentence.length > 130 ? firstSentence.slice(0, 127) + '...' : (firstSentence ? (firstSentence.endsWith('.') ? firstSentence : firstSentence + '.') : '')
+      cands.set(ml, {
+        measure: c.metadata.measure,
+        table: c.metadata.table || '',
+        shortDescription,
+        formula: c.metadata.formula || '',
+        score,
+      })
+    }
+  }
+  const sorted = [...cands.values()].sort((a, b) => b.score - a.score).slice(0, topN)
+  if (!sorted.length) return []
+  const maxScore = sorted[0].score || 1
+  return sorted.map(item => ({
+    measure: item.measure,
+    table: item.table,
+    shortDescription: item.shortDescription,
+    formula: item.formula,
+    confidenceScore: Math.min(100, Math.round((item.score / maxScore) * 100)),
+  }))
+}
 let db=null
 async function getDb() {
   if (db) return db
@@ -1784,10 +1830,10 @@ app.post('/chat/message', requireClientKey, withRequestTimeout(async (req,res) =
     const intentResult=resolveIntent(query.trim())
     if (intentResult) {
       const cid=await saveConversationMessage(clientId,conversationId||null,query.trim(),intentResult.response,[])
-      return res.json({answer:intentResult.response,sources:[],relatedKeywords:[],conversationId:cid,client:{clientId,name}})
+      return res.json({answer:intentResult.response,sources:[],relatedKeywords:[],relatedMetrics:[],conversationId:cid,client:{clientId,name}})
     }
     const val=validateQuery(query)
-    if (!val.valid) return res.json({answer:val.message,sources:[],relatedKeywords:[],conversationId:conversationId||null,client:{clientId,name}})
+    if (!val.valid) return res.json({answer:val.message,sources:[],relatedKeywords:[],relatedMetrics:[],conversationId:conversationId||null,client:{clientId,name}})
     const cacheKey=getCacheKey(clientId,query)
     const cached=responseCacheGet(cacheKey)
     if (cached) {
@@ -1799,7 +1845,7 @@ app.post('/chat/message', requireClientKey, withRequestTimeout(async (req,res) =
     }
     const reqPromise=(async()=>{
       const {chunks,invertedIndex,docType}=await loadChunksForClient(clientId)
-      if (!chunks?.length) return {answer:'No documents found. Please ingest documents first.',sources:[],relatedKeywords:[],client:{clientId,name}}
+      if (!chunks?.length) return {answer:'No documents found. Please ingest documents first.',sources:[],relatedKeywords:[],relatedMetrics:[],client:{clientId,name}}
       let pq=applyTypos(query.trim())
       pq=applySynonyms(pq)
       pq=fuzzyCorrectQuery(pq,chunks)
@@ -1809,20 +1855,24 @@ app.post('/chat/message', requireClientKey, withRequestTimeout(async (req,res) =
       if (eIntent==='all_urls') {
         const uc=chunks.filter(c=>/https?:\/\/\S+/.test(c.text||''))
         const entries=extractAllUrlsFromChunks(uc)
-        return {answer:entries.length?entries.map(e=>`**${e.name}:** ${e.url}`).join('\n'):'No URLs found.',sources:buildDedupedSources(uc.slice(0,5)),relatedKeywords:[],client:{clientId,name}}
+        return {answer:entries.length?entries.map(e=>`**${e.name}:** ${e.url}`).join('\n'):'No URLs found.',sources:buildDedupedSources(uc.slice(0,5)),relatedKeywords:[],relatedMetrics:[],client:{clientId,name}}
       }
       const multi=detectMultiTopicQuery(pq)
       if (multi.isMulti) {
         const answer=await handleMultiTopicQuery(multi.topics,multi.mode,chunks,Math.min(topK,MAX_HITS_GLOBAL),invertedIndex,eDocType)
-        return {answer,sources:[],relatedKeywords:[],client:{clientId,name}}
+        return {answer,sources:[],relatedKeywords:[],relatedMetrics:[],client:{clientId,name}}
       }
       let hits=await retrieveChunks(pq,chunks,Math.min(topK,MAX_HITS_GLOBAL),invertedIndex,eDocType)
       if (!hits.length) hits=relaxedKeywordSearch(pq,chunks,32,invertedIndex)
-      if (!hits.length) return {answer:'I could not find relevant information. Try rephrasing your question.',sources:[],relatedKeywords:[],client:{clientId,name}}
+      if (!hits.length) return {answer:'I could not find relevant information. Try rephrasing your question.',sources:[],relatedKeywords:[],relatedMetrics:[],client:{clientId,name}}
       const answer=await generateAnswerWithFallback(pq,hits,eIntent,eDocType,chunks,invertedIndex,Math.min(topK,MAX_HITS_GLOBAL))
       const sources=buildDedupedSources(hits)
-      const related=buildRelatedKeywords(extractSubject(pq),hits,chunks,invertedIndex,RELATED_KEYWORDS_COUNT)
-      return {answer,sources,relatedKeywords:related,client:{clientId,name}}
+      const subject=extractSubject(pq)
+      const related=buildRelatedKeywords(subject,hits,chunks,invertedIndex,RELATED_KEYWORDS_COUNT)
+      const hasMeasureData=chunks.some(c=>c.metadata?.measure&&!c.metadata._expansionRow)
+      const isDefinitionOrGeneral=['definition','general','calculation'].includes(eIntent)
+      const relatedMetrics=(hasMeasureData&&isDefinitionOrGeneral)?buildRelatedMetrics(subject,hits,chunks,6):[]
+      return {answer,sources,relatedKeywords:related,relatedMetrics,client:{clientId,name}}
     })()
     IN_FLIGHT.set(cacheKey,reqPromise)
     let result
