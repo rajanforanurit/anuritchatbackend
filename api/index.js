@@ -59,6 +59,8 @@ const CONTEXT_CHAR_LIMIT = 2800
 const RELATED_KEYWORDS_COUNT = 5
 const RELATED_KEYWORDS_MIN_SCORE = 1
 
+const SENTENCE_WINDOW_SIZE = 2
+
 const blobServiceClient = AZURE_CONNECTION_STRING ? BlobServiceClient.fromConnectionString(AZURE_CONNECTION_STRING) : null
 const SUPPORTED_EXTENSIONS = new Set(['.pdf', '.docx', '.xlsx', '.json', '.txt', '.csv'])
 
@@ -167,6 +169,7 @@ function detectDocumentType(chunks) {
     if (/^(section|article|clause|\d+\.\d+)/im.test(c.text||'')) policy += 2
     if (/\b(abstract|introduction|methodology|conclusion|accuracy|precision|recall|epoch|neural|dataset|training|classification|algorithm)\b/.test(t)) research++
     if (/\b(figure\s+\d|table\s+\d|et\s+al|doi:|references?|ieee|arxiv)\b/.test(t)) research += 2
+    if (/\b(employee|employer|conduct|leave|attendance|harassment|compensation|payroll|remote\s+work|performance|handbook|hr)\b/.test(t)) policy += 2
   }
   if (research > policy*2 && research > dict*2) return 'research'
   if (policy > dict*1.5 && policy > research*1.5) return 'policy'
@@ -187,6 +190,8 @@ function detectQueryIntent(q) {
   if (/\b(how\s+(many|much|long|often)|duration|period|days|months|amount|limit|maximum|minimum|deadline)\b/i.test(n) &&
       /\b(notice|deposit|rent|fee|penalty|maintenance|payment)\b/i.test(n)) return 'policy_numeric'
   if (/\b(policy|clause|rule|requirement|condition|obligation|responsibility|procedure)\b/i.test(n)) return 'policy_lookup'
+  if (/\b(how\s+(should|do|can|must)\s+(employee|staff|worker|i)|what\s+(should|must|do)\s+(employee|staff|worker|i))\b/i.test(n)) return 'policy_lookup'
+  if (/\b(report|reporting|escalate|escalation|notify|notification|submit|raise|file)\b/i.test(n)) return 'policy_lookup'
   if (/^(what\s+is\s+(the\s+)?(definition|meaning)|define|what\s+(is|are)|explain|tell\s+me\s+about|describe|meaning\s+of)/i.test(n) ||
       /\b(definition|meaning)\b/i.test(n)) return 'definition'
   if (/\b(vs|versus|difference|compare|between)\b/.test(n)) return 'comparison'
@@ -399,6 +404,15 @@ function expandQueryForPolicy(q) {
   if (/\bpet\b/.test(l)) exp.push('pet policy allowed permitted deposit fee')
   if (/\b(sublease|sublet)\b/.test(l)) exp.push('sublease sublet permission consent landlord')
   if (/\brenewal\b/.test(l)) exp.push('lease renewal term extension option notice')
+  if (/\b(report|reporting|unethical|misconduct|ethics)\b/.test(l)) exp.push('report unethical behavior reporting channels HR escalation ethics committee anonymous')
+  if (/\b(leave|absence|attendance|absent)\b/.test(l)) exp.push('leave attendance absence casual sick earned maternity paternity')
+  if (/\b(remote|hybrid|work\s+from\s+home|wfh)\b/.test(l)) exp.push('remote work hybrid flexible arrangement available business hours')
+  if (/\b(harassment|discrimination|equal\s+opportunity|inclusive)\b/.test(l)) exp.push('harassment discrimination equal opportunity inclusive complaint report')
+  if (/\b(performance|evaluation|review|appraisal)\b/.test(l)) exp.push('performance evaluation review appraisal objectives assessment')
+  if (/\b(salary|compensation|payroll|benefits|insurance)\b/.test(l)) exp.push('compensation salary payroll benefits medical insurance')
+  if (/\b(safety|emergency|evacuation|incident)\b/.test(l)) exp.push('safety emergency evacuation incident workplace health')
+  if (/\b(data|security|privacy|confidential|password)\b/.test(l)) exp.push('data privacy security confidential password information')
+  if (/\b(disciplin|warning|suspension|terminat)\b/.test(l)) exp.push('disciplinary action warning suspension termination conduct violation')
   return exp.length ? q + ' ' + exp.join(' ') : q
 }
 
@@ -419,10 +433,10 @@ function computeBM25Score(terms, text, avgLen, k1=1.5, b=0.75) {
 function computePolicyRelevanceScore(q, text, intent) {
   const t = text.toLowerCase()
   let score = 0
-  const signals = ['shall','must','may','tenant','landlord','lessee','lessor','pursuant','hereby','thereof','herein','notwithstanding','whereas','obligation','liability','clause','section','article']
+  const signals = ['shall','must','may','tenant','landlord','lessee','lessor','pursuant','hereby','thereof','herein','notwithstanding','whereas','obligation','liability','clause','section','article','employee','employer','encouraged','required','prohibited','expected']
   score += signals.filter(s => t.includes(s)).length * 2
-  if (intent === 'policy_consequence' && /\b(penalty|consequence|liable|breach|default|eviction|forfeit|charge|fine)\b/.test(t)) score += 20
-  if (intent === 'policy_permission' && /\b(permitted|allowed|may|shall\s+not|must\s+not|prohibited|forbidden|cannot|restricted)\b/.test(t)) score += 20
+  if (intent === 'policy_consequence' && /\b(penalty|consequence|liable|breach|default|eviction|forfeit|charge|fine|disciplinary|warning|suspension|termination)\b/.test(t)) score += 20
+  if (intent === 'policy_permission' && /\b(permitted|allowed|may|shall\s+not|must\s+not|prohibited|forbidden|cannot|restricted|encouraged)\b/.test(t)) score += 20
   if (intent === 'policy_numeric' && /\b\d+\s*(days?|months?|years?|percent|%)\b/.test(t)) score += 25
   if (/^(section|article|clause|\d+\.\d+)/im.test(text)) score += 10
   return score
@@ -435,10 +449,19 @@ function lightweightRerank(q, chunks, intent, docType) {
   const totalLen = chunks.reduce((s,c) => s + (c.text||'').split(/\s+/).length, 0)
   const avgLen = totalLen / chunks.length || 100
   const isPolicy = ['policy_lookup','policy_consequence','policy_permission','policy_numeric'].includes(intent)
+
   return chunks.map(c => {
     const text = c.text||''
+    const focusSentence = c.metadata?.focus_sentence || ''
     let score = computeBM25Score(terms, text, avgLen) * 10
     if (isPolicy || docType === 'policy') score += computePolicyRelevanceScore(q, text, intent)
+
+    if (focusSentence) {
+      const focusBM25 = computeBM25Score(terms, focusSentence, avgLen) * 20
+      score += focusBM25
+      if (isPolicy && /\b(encouraged|required|must|shall|prohibited|expected|may)\b/i.test(focusSentence)) score += 15
+    }
+
     if (c.metadata?.section_heading) {
       const hl = (c.metadata.section_heading||'').toLowerCase()
       score += terms.filter(t => hl.includes(t)).length * 8
@@ -457,7 +480,9 @@ function lightweightRerank(q, chunks, intent, docType) {
 function buildInvertedIndex(chunks) {
   const idx = new Map()
   for (let i=0; i<chunks.length; i++) {
-    const words = (chunks[i].text||'').toLowerCase().replace(/[^\w\s]/g,' ').split(/\s+/)
+    const focusSentence = chunks[i].metadata?.focus_sentence || ''
+    const fullText = (chunks[i].text||'') + ' ' + focusSentence
+    const words = fullText.toLowerCase().replace(/[^\w\s]/g,' ').split(/\s+/)
     for (const w of words) {
       if (w.length < 2) continue
       if (!idx.has(w)) idx.set(w, new Set())
@@ -491,6 +516,7 @@ function keywordSearch(q, chunks, topK, intent, invertedIndex) {
 
   return source.map(c => {
     const text = (c.text||'').toLowerCase()
+    const focusSentence = (c.metadata?.focus_sentence||'').toLowerCase()
     let score = 0
     if (intent === 'url_lookup') {
       if (!text.includes('http')) return {...c, _score:0}
@@ -501,16 +527,24 @@ function keywordSearch(q, chunks, topK, intent, invertedIndex) {
     } else {
       if (subjectRegex.test(c.text||'')) {
         score += subjectWords.length * 6
-        if (/\b(is defined as|is calculated as|formula:|shall|must|means)/i.test((c.text||'').slice(0, (c.text||'').toLowerCase().indexOf(subject.toLowerCase())+100))) score += subjectWords.length * 8
+        if (/\b(is defined as|is calculated as|formula:|shall|must|means|encouraged|required|expected|prohibited)\b/i.test((c.text||'').slice(0, (c.text||'').toLowerCase().indexOf(subject.toLowerCase())+200))) score += subjectWords.length * 8
       }
       score += subjectWords.filter(w => new RegExp(`\\b${escapeRegex(w)}\\b`,'i').test(c.text||'')).length * 2
+
+      if (focusSentence && subjectRegex.test(focusSentence)) {
+        score += subjectWords.length * 10
+      }
+      if (focusSentence) {
+        score += subjectWords.filter(w => new RegExp(`\\b${escapeRegex(w)}\\b`,'i').test(focusSentence)).length * 4
+      }
+
       if (new RegExp(`\\b${escapeRegex(qLower)}\\b`,'i').test(c.text||'')) score += 3
       if (intent === 'calculation') {
         if (/\b(formula|calculated\s+as|computed\s+as|how\s+to\s+calculate|formula\s+for)\b/i.test(text)) score += 15
         if (text.includes('=') || text.includes('/')) score += 5
       }
-      if (intent === 'policy_consequence' && /\b(penalty|consequence|liable|breach|default|eviction|forfeit)\b/i.test(text)) score += 20
-      if (intent === 'policy_permission' && /\b(permitted|allowed|may\s+(not)?|shall\s+not|must\s+not|prohibited|forbidden)\b/i.test(text)) score += 20
+      if (intent === 'policy_consequence' && /\b(penalty|consequence|liable|breach|default|eviction|forfeit|disciplinary|warning|suspension|termination)\b/i.test(text)) score += 20
+      if (intent === 'policy_permission' && /\b(permitted|allowed|may\s+(not)?|shall\s+not|must\s+not|prohibited|forbidden|encouraged|required)\b/i.test(text)) score += 20
       if (intent === 'policy_numeric' && /\b\d+\s*(days?|months?|years?|percent|%)\b/i.test(text)) score += 20
       if (c.metadata?.section_heading && subjectWords.some(w => (c.metadata.section_heading||'').toLowerCase().includes(w))) score += 25
       if (c.metadata?.measure) {
@@ -540,7 +574,9 @@ function relaxedKeywordSearch(q, chunks, topK, invertedIndex) {
   const source = union.size ? [...union].map(i => chunks[i]).filter(Boolean) : chunks.slice(0,300)
   return source.map(c => {
     const text = (c.text||'').toLowerCase()
+    const focusSentence = (c.metadata?.focus_sentence||'').toLowerCase()
     const matched = words.filter(w => new RegExp(`\\b${escapeRegex(w)}\\b`,'i').test(text)).length
+    const focusMatched = focusSentence ? words.filter(w => new RegExp(`\\b${escapeRegex(w)}\\b`,'i').test(focusSentence)).length * 2 : 0
     const subjectMatch = subject.length > 2 && new RegExp(`\\b${escapeRegex(subject.toLowerCase())}\\b`,'i').test(text) ? 5 : 0
     let meta = 0
     if (c.metadata?.measure) {
@@ -550,7 +586,7 @@ function relaxedKeywordSearch(q, chunks, topK, invertedIndex) {
     }
     if (c.metadata?.section_heading) meta += words.filter(w => (c.metadata.section_heading||'').toLowerCase().includes(w)).length * 5
     const penalty = computeNegativePenalty(subject, c.text||'')
-    return {...c, _score: Math.max(0, matched + subjectMatch + meta - penalty)}
+    return {...c, _score: Math.max(0, matched + focusMatched + subjectMatch + meta - penalty)}
   }).filter(c => c._score > 0).sort((a,b) => b._score - a._score).slice(0, topK)
 }
 
@@ -579,7 +615,7 @@ async function retrieveChunks(q, chunks, topK, invertedIndex, docType, _retry=fa
   if (!top.length) top = relaxedKeywordSearch(sq, chunks, Math.min(topK*2, 32), invertedIndex).slice(0, Math.min(topK, MAX_HITS_GLOBAL))
   if (top.length > 1) top = lightweightRerank(q, top, intent, docType)
 
-  const effectiveTopK = intent === 'definition' ? 3 : intent === 'calculation' ? 3 : isPolicy ? 4 : 4
+  const effectiveTopK = intent === 'definition' ? 3 : intent === 'calculation' ? 3 : isPolicy ? 5 : 4
   return top.slice(0, Math.min(effectiveTopK, MAX_HITS_GLOBAL))
 }
 
@@ -588,20 +624,26 @@ function buildContext(hits) {
   const deduped = []
   for (const h of hits) {
     if (h.metadata?._expansionRow) continue
-    const fp = (h.text||'').trim().slice(0,80).toLowerCase()
+    const fp = (h.metadata?.focus_sentence || h.text||'').trim().slice(0,80).toLowerCase()
     if (!seen.has(fp)) { seen.add(fp); deduped.push(h) }
     if (deduped.length >= 5) break
   }
   let total = 0
   const parts = []
   for (let i=0; i<deduped.length; i++) {
-    const limit = i === 0 ? Math.min(700, CONTEXT_CHAR_LIMIT - total) : Math.min(500, CONTEXT_CHAR_LIMIT - total)
+    const limit = i === 0 ? Math.min(800, CONTEXT_CHAR_LIMIT - total) : Math.min(600, CONTEXT_CHAR_LIMIT - total)
     if (limit < 50) break
     let header = `[S${i+1}]`
-    if (deduped[i].metadata?.section_heading) header += `[${deduped[i].metadata.section_heading.slice(0,40)}]`
-    const text = (deduped[i].text||'').trim().slice(0, limit)
-    parts.push(`${header}\n${text}`)
-    total += text.length + 20
+    if (deduped[i].metadata?.section_heading) header += `[${deduped[i].metadata.section_heading.slice(0,50)}]`
+    const windowText = (deduped[i].text||'').trim()
+    const focusSentence = deduped[i].metadata?.focus_sentence
+    let contextBlock = windowText.slice(0, limit)
+    if (focusSentence && !contextBlock.includes(focusSentence.slice(0,30))) {
+      contextBlock = focusSentence + '\n' + contextBlock
+    }
+    contextBlock = contextBlock.slice(0, limit)
+    parts.push(`${header}\n${contextBlock}`)
+    total += contextBlock.length + 20
   }
   return parts.join('\n---\n')
 }
@@ -609,11 +651,11 @@ function buildContext(hits) {
 function buildSystemPrompt(intent, docType) {
   const isPolicy = docType === 'policy' || ['policy_lookup','policy_consequence','policy_permission','policy_numeric'].includes(intent)
   if (isPolicy) {
-    const rule = intent==='policy_consequence' ? 'State exact penalty, amount, timeframe, or procedure.' :
+    const rule = intent==='policy_consequence' ? 'State exact penalty, amount, timeframe, or procedure. Be specific.' :
       intent==='policy_permission' ? 'State clearly if permitted or prohibited and any conditions.' :
       intent==='policy_numeric' ? 'State the exact number (days/months/amount/%). Do not approximate.' :
-      'Explain the relevant rule or requirement plainly.'
-    return `Answer from context only. Plain language. 2-3 sentences max. No source references. If not found say so.\n${rule}`
+      'Find and state the specific rule, procedure, or guideline that directly answers the question. Do not answer with tangentially related policy text.'
+    return `You are a precise HR and policy document assistant. Answer ONLY from the provided context. Use plain language. Answer in 1-3 complete sentences. Do not cite source labels like [S1] or [S2]. If the specific answer is not found, say so clearly.\n\nCRITICAL INSTRUCTION: Match your answer to the EXACT question asked. Read the question carefully. If the question is about HOW TO REPORT something, answer about the reporting process. If the question is about WHAT HAPPENS as a consequence, answer about consequences. These are different topics even if they appear in the same document section. Do NOT confuse them.\n\n${rule}`
   }
   if (docType === 'research') return `Answer from context only. Factual and precise. State exact numbers for metrics. 2-3 sentences. No source references.`
   const rule = intent==='definition' ? 'One sentence definition only. Bold name. No formula.' :
@@ -637,7 +679,7 @@ function buildUserMessage(q, hits, intent, docType) {
   else if (intent === 'comparison')
     inst = `\nCompare: ${q}. Bold each. Short definition each. "**Key Difference:**" at end.`
   else if (isPolicy || docType === 'policy')
-    inst = `\nAnswer this policy question: "${q}". Specific and direct. 2-3 sentences.`
+    inst = `\nQUESTION: "${q}"\n\nFind the sentence(s) in the context that DIRECTLY answer this specific question. The question is asking about: "${subject}". Ignore sentences that discuss different aspects of the same section. Answer only what the question asks. Be direct and specific in 1-3 sentences.`
   else if (docType === 'research')
     inst = `\nAnswer from the research context: "${q}". Precise. State exact numbers.`
   else
@@ -703,14 +745,22 @@ function buildFallbackAnswer(q, hits, intent, docType) {
     }
     return "No matching URL found."
   }
+
   if (isPolicy || docType === 'research') {
+    const focusSentences = hits
+      .map(h => h.metadata?.focus_sentence)
+      .filter(Boolean)
+      .filter(s => new RegExp(`\\b${esc}\\b`,'i').test(s))
+    if (focusSentences.length) {
+      return ensureSinglePeriod(trimToCompleteSentence([...new Set(focusSentences)].slice(0,2).join(' '), 400))
+    }
     const lines = []
     for (const h of hits) {
       for (const line of (h.text||'').split(/\n+/)) {
         if (line.trim().length < 20) continue
         const relevant = docType === 'research'
           ? /\b(\d+\.?\d*\s*%?|accuracy|precision|recall|model|result)\b/i.test(line)
-          : /\b(shall|must|may|tenant|landlord|days?|months?|\d+|notice|deposit|rent|fee|penalty)\b/i.test(line)
+          : /\b(shall|must|may|employee|employer|days?|months?|\d+|notice|deposit|rent|fee|penalty|encouraged|required|expected|prohibited)\b/i.test(line)
         if (relevant || new RegExp(`\\b${esc}\\b`,'i').test(line)) lines.push(line.trim())
       }
     }
@@ -927,6 +977,62 @@ async function handleMultiTopicQuery(topics, mode, chunks, topK, invertedIndex, 
 
 async function extractPdf(buffer) { const r = await pdfParse(buffer); return r.text||'' }
 
+function splitIntoSentences(text) {
+  if (!text) return []
+  const normalized = text
+    .replace(/\r\n/g, '\n')
+    .replace(/\n+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+
+  const raw = []
+  const abbrevSafePattern = /(?<![A-Z][a-z]?\.|Mr\.|Ms\.|Dr\.|Sr\.|Jr\.|vs\.|etc\.|i\.e\.|e\.g\.)([.!?])\s+(?=[A-Z"'])/g
+  let lastIndex = 0
+  let match
+  while ((match = abbrevSafePattern.exec(normalized)) !== null) {
+    const sentence = normalized.slice(lastIndex, match.index + 1).trim()
+    if (sentence.length > 15) raw.push(sentence)
+    lastIndex = match.index + match[0].length - (match[0].length - match[0].trimStart().length)
+    abbrevSafePattern.lastIndex = match.index + 1
+  }
+  const remaining = normalized.slice(lastIndex).trim()
+  if (remaining.length > 15) raw.push(remaining)
+
+  if (raw.length === 0 && normalized.length > 15) return [normalized]
+  return raw
+}
+
+function chunkDocxBySentenceWindow(text, sourceFile, sectionHeading, headingLevel, windowSize) {
+  const sentences = splitIntoSentences(text)
+  if (!sentences.length) return []
+  const chunks = []
+  for (let i = 0; i < sentences.length; i++) {
+    const start = Math.max(0, i - windowSize)
+    const end = Math.min(sentences.length - 1, i + windowSize)
+    const window = sentences.slice(start, end + 1).join(' ')
+    const focusSentence = sentences[i]
+    const isDefinitionLike = /\b(is defined as|means|refers to|encouraged to|required to|must|shall|prohibited|expected to)\b/i.test(focusSentence)
+    chunks.push({
+      text: window,
+      source_file: sourceFile,
+      chunk_index: 0,
+      embedding: [],
+      metadata: {
+        section_heading: sectionHeading || '',
+        heading_level: headingLevel || 0,
+        focus_sentence: focusSentence,
+        sentence_index: i,
+        sentence_total: sentences.length,
+        window_start: start,
+        window_end: end,
+        is_definition_chunk: isDefinitionLike,
+        chunk_position: i < 2 ? 'early' : i > sentences.length - 3 ? 'late' : 'middle',
+      }
+    })
+  }
+  return chunks
+}
+
 async function extractWordWithHeadings(buffer) {
   const styleMap = [
     "p[style-name='Heading 1'] => h1:fresh",
@@ -947,37 +1053,54 @@ async function extractWordWithHeadings(buffer) {
   }
 }
 
-function htmlToStructuredChunks(html, sourceFile) {
+function htmlToSentenceWindowChunks(html, sourceFile) {
   const chunks = []
-  let chunkIndex = 0
-  const headingRe = /<(h[1-4])>(.*?)<\/h[1-4]>/gi
+  let globalChunkIndex = 0
   const tagStripRe = /<[^>]+>/g
-  const decode = s => s.replace(/&amp;/g,'&').replace(/&lt;/g,'<').replace(/&gt;/g,'>').replace(/&nbsp;/g,' ').replace(/&#(\d+);/g,(_,n)=>String.fromCharCode(n)).replace(/&quot;/g,'"')
+  const decode = s => s
+    .replace(/&amp;/g,'&').replace(/&lt;/g,'<').replace(/&gt;/g,'>')
+    .replace(/&nbsp;/g,' ').replace(/&#(\d+);/g,(_,n)=>String.fromCharCode(n))
+    .replace(/&quot;/g,'"').replace(/&#x2019;/g,"'").replace(/&#x2018;/g,"'")
+    .replace(/&#x201C;/g,'"').replace(/&#x201D;/g,'"')
 
+  const headingRe = /<(h[1-4])>(.*?)<\/h[1-4]>/gi
   let lastIndex = 0, currentHeading = '', currentLevel = 0
+  const sections = []
   let match
   headingRe.lastIndex = 0
-
-  const sections = []
   while ((match = headingRe.exec(html)) !== null) {
-    if (lastIndex < match.index) sections.push({ heading: currentHeading, level: currentLevel, content: html.slice(lastIndex, match.index) })
+    if (lastIndex < match.index) {
+      sections.push({ heading: currentHeading, level: currentLevel, content: html.slice(lastIndex, match.index) })
+    }
     currentHeading = decode(match[2].replace(tagStripRe,'').trim())
     currentLevel = parseInt(match[1][1])
     lastIndex = match.index + match[0].length
   }
-  if (lastIndex < html.length) sections.push({ heading: currentHeading, level: currentLevel, content: html.slice(lastIndex) })
+  if (lastIndex < html.length) {
+    sections.push({ heading: currentHeading, level: currentLevel, content: html.slice(lastIndex) })
+  }
 
   for (const sec of sections) {
-    const text = decode(sec.content.replace(/<\/?(p|li|br|div|ul|ol|td|tr)[^>]*>/gi,'\n').replace(tagStripRe,'').replace(/\n{3,}/g,'\n\n').trim())
-    if (text.length < 20) continue
-    const fullText = sec.heading ? `${sec.heading}\n${text}` : text
-    if (fullText.length <= POLICY_CHUNK_SIZE) {
-      chunks.push({ text: fullText, source_file: sourceFile, chunk_index: chunkIndex++, embedding: [], metadata: { section_heading: sec.heading||'', heading_level: sec.level, is_definition_chunk: /\b(is defined as|means|refers to)\b/i.test(fullText), chunk_position: chunkIndex < 3 ? 'early' : 'middle' } })
-    } else {
-      const subs = splitWithOverlap(fullText, POLICY_CHUNK_SIZE, POLICY_CHUNK_OVERLAP)
-      for (const sub of subs) chunks.push({ text: sub, source_file: sourceFile, chunk_index: chunkIndex++, embedding: [], metadata: { section_heading: sec.heading||'', heading_level: sec.level, is_definition_chunk: /\b(is defined as|means|refers to)\b/i.test(sub), chunk_position: 'middle' } })
+    const rawText = decode(
+      sec.content
+        .replace(/<\/?(p|li|br|div|ul|ol|td|tr)[^>]*>/gi, '\n')
+        .replace(tagStripRe, '')
+        .replace(/\n{3,}/g, '\n\n')
+        .trim()
+    )
+    if (rawText.length < 20) continue
+
+    const paragraphs = rawText.split(/\n{2,}/).map(p => p.trim()).filter(p => p.length > 20)
+
+    for (const para of paragraphs) {
+      const sentenceChunks = chunkDocxBySentenceWindow(para, sourceFile, sec.heading, sec.level, SENTENCE_WINDOW_SIZE)
+      for (const sc of sentenceChunks) {
+        sc.chunk_index = globalChunkIndex++
+        chunks.push(sc)
+      }
     }
   }
+
   return chunks
 }
 
@@ -1058,6 +1181,7 @@ function isPolicyDocument(text, fileName) {
   if (/\b(agreement|contract|policy|lease|terms|offer|salary|compensation|joining)\b/.test(s)) sig+=2
   if (/\b(security deposit|notice period|termination|eviction|maintenance|late fee|probation|benefits)\b/.test(s)) sig+=3
   if (/^(section|article|clause|\d+\.\d+)\s/im.test(text.slice(0,5000))) sig+=3
+  if (/\b(employee|employer|conduct|leave|attendance|harassment|compensation|payroll|remote\s+work|performance|handbook|hr)\b/.test(s)) sig+=3
   if (/\b(abstract|methodology|conclusion|accuracy|precision|recall|epoch|neural|figure|table\s+\d)\b/.test(s)) sig-=3
   return sig >= 5
 }
@@ -1199,21 +1323,40 @@ async function _doLoadChunks(clientId) {
       const fileName = blobName.split('/').pop()
       const ext = ('.'+fileName.split('.').pop()).toLowerCase()
       const buffer = await downloadBlobAsBuffer(container, blobName)
+
       if (ext==='.xlsx') {
         return extractSpreadsheet(buffer).map((r,idx)=>({text:r.text,source_file:fileName,chunk_index:idx,embedding:[],metadata:r.metadata||null}))
       }
+
       if (ext==='.docx') {
         const {html, hasHeadings} = await extractWordWithHeadings(buffer)
         if (!html?.trim()) return []
+
         if (hasHeadings) {
-          const chunks = htmlToStructuredChunks(html, fileName)
-          if (chunks.length > 0) { console.log(`[chunkLoader] heading+para hybrid: ${fileName} (${chunks.length} chunks)`); return chunks }
+          const chunks = htmlToSentenceWindowChunks(html, fileName)
+          if (chunks.length > 0) {
+            console.log(`[chunkLoader] sentence-window docx (headed): ${fileName} (${chunks.length} chunks)`)
+            return chunks
+          }
         }
+
         const plainText = html.replace(/<[^>]+>/g,' ').replace(/\s+/g,' ').trim()
         if (!plainText) return []
-        if (isPolicyDocument(plainText, fileName)) { console.log(`[chunkLoader] policy fallback: ${fileName}`); return chunkPlainText(plainText, fileName, POLICY_CHUNK_SIZE, POLICY_CHUNK_OVERLAP, true) }
-        return chunkPlainText(plainText, fileName, CHUNK_SIZE, CHUNK_OVERLAP, false)
+
+        const paragraphs = plainText.split(/\s{3,}|\n\n+/).map(p => p.trim()).filter(p => p.length > 20)
+        const chunks = []
+        let idx = 0
+        for (const para of paragraphs) {
+          const sentChunks = chunkDocxBySentenceWindow(para, fileName, '', 0, SENTENCE_WINDOW_SIZE)
+          for (const sc of sentChunks) { sc.chunk_index = idx++; chunks.push(sc) }
+        }
+        if (chunks.length > 0) {
+          console.log(`[chunkLoader] sentence-window docx (plain): ${fileName} (${chunks.length} chunks)`)
+          return chunks
+        }
+        return chunkPlainText(plainText, fileName, POLICY_CHUNK_SIZE, POLICY_CHUNK_OVERLAP, true)
       }
+
       const text = await extractTextFromBuffer(buffer, fileName)
       if (!text?.trim()) return []
       if (isResearchDocument(text, fileName)) { console.log(`[chunkLoader] research: ${fileName}`); return chunkResearchDocument(text, fileName) }
@@ -1387,10 +1530,21 @@ function buildDedupedSources(hits) {
     if (h.metadata?._expansionRow) continue
     const key = h.metadata?.measure ? `measure:${h.metadata.measure.toLowerCase().trim()}` :
       h.metadata?.url ? `url:${h.metadata.url.toLowerCase().trim()}` :
-      `text:${(h.text||'').trim().slice(0,80).toLowerCase()}`
+      `text:${(h.metadata?.focus_sentence||h.text||'').trim().slice(0,80).toLowerCase()}`
     if (seen.has(key)) continue
     seen.add(key)
-    out.push({source_file:h.source_file||'unknown',chunk_index:h.chunk_index??0,score:typeof h._score==='number'?parseFloat(h._score.toFixed(4)):null,measure:h.metadata?.measure||null,table:h.metadata?.table||null,preview:trimPreviewToSentence(h.text||'',200)})
+    const preview = h.metadata?.focus_sentence
+      ? trimPreviewToSentence(h.metadata.focus_sentence, 200)
+      : trimPreviewToSentence(h.text||'', 200)
+    out.push({
+      source_file:h.source_file||'unknown',
+      chunk_index:h.chunk_index??0,
+      score:typeof h._score==='number'?parseFloat(h._score.toFixed(4)):null,
+      measure:h.metadata?.measure||null,
+      table:h.metadata?.table||null,
+      section:h.metadata?.section_heading||null,
+      preview
+    })
   }
   return out
 }
