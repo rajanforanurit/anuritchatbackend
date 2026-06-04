@@ -11,6 +11,7 @@ const Papa=require('papaparse')
 const stringSimilarity=require('string-similarity')
 const crypto=require('crypto')
 const {resolveIntent,setLLMCaller}=require('./src/ed')
+const {searchExamples,generateExampleSearchQuery}=require('./src/searchService')
 const app=express()
 const allowedOrigins=['http://localhost:8080','http://localhost:3000','https://app.powerbi.com','https://msit.powerbi.com','https://anuritchat.vercel.app','https://askdatatest.vercel.app','https://ragadminpanel.vercel.app','https://df.powerbi.com','https://www.anuritinnovation.com/','https://api.powerbi.com']
 const originAllowed=o=>!o||o==='null'||allowedOrigins.includes(o)||/\.(powerbi|microsoft|office)\.com$/.test(o)
@@ -37,6 +38,7 @@ const ASKDATA2_TIMEOUT_MS=parseInt(process.env.ASKDATA2_TIMEOUT_MS||'30000',10)
 const ASKDATA2_REWRITE_TIMEOUT_MS=parseInt(process.env.ASKDATA2_REWRITE_TIMEOUT_MS||'8000',10)
 const REQUEST_TIMEOUT_MS=parseInt(process.env.REQUEST_TIMEOUT_MS||'60000',10)
 const WARMUP_CLIENT_IDS=(process.env.WARMUP_CLIENT_IDS||'').split(',').map(s=>s.trim()).filter(Boolean)
+const SEARXNG_URL=process.env.SEARXNG_URL||'https://searchxngaskdata.jollywave-6f5db9ec.centralindia.azurecontainerapps.io'
 const RAW_PREFIX='raw'
 const CHUNK_SIZE=900
 const CHUNK_OVERLAP=100
@@ -1901,6 +1903,35 @@ if(result.answer?.length>15) responseCacheSet(cacheKey,result)
 const cid=await saveConversationMessage(clientId,conversationId||null,query.trim(),result.answer,result.sources||[])
 res.json({...result,conversationId:cid})
 }catch(e){console.error('[chat/message]',e.message);if(!res.headersSent) res.status(500).json({error:e.message})}
+}))
+app.post('/api/web-search', requireClientKey, withRequestTimeout(async (req, res) => {
+
+  try {
+
+    const { question, answer } = req.body
+
+    if (!question || typeof question !== 'string' || !question.trim()) {
+      return res.status(400).json({ success: false, error: 'question is required' })
+    }
+
+    const query = generateExampleSearchQuery(question.trim(), answer || '')
+
+    console.log(`[web-search] client=${req.client.clientId} question="${question.trim()}" generatedQuery="${query}"`)
+
+    const results = await searchExamples(query)
+
+    return res.json({ success: true, query, results })
+
+  } catch (e) {
+
+    console.error('[web-search] error:', e.message)
+
+    if (!res.headersSent) {
+      return res.status(500).json({ success: false, error: 'Web search failed. Please try again.' })
+    }
+
+  }
+
 }))
 app.use((err,req,res,next)=>{console.error('[global error]',err);if(!res.headersSent) res.status(500).json({error:'Unexpected error.'})})
 if(process.env.VERCEL!=='1'){
