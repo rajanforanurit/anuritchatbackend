@@ -11,7 +11,7 @@ const Papa=require('papaparse')
 const stringSimilarity=require('string-similarity')
 const crypto=require('crypto')
 const {resolveIntent,setLLMCaller}=require('./src/ed')
-const {searchExamples,generateExampleSearchQuery}=require('./src/searchService')
+const {searchExamples,generateExampleSearchQuery}=require('./src/searchservice')
 const app=express()
 const allowedOrigins=['http://localhost:8080','http://localhost:3000','https://app.powerbi.com','https://msit.powerbi.com','https://anuritchat.vercel.app','https://askdatatest.vercel.app','https://ragadminpanel.vercel.app','https://df.powerbi.com','https://www.anuritinnovation.com/','https://api.powerbi.com']
 const originAllowed=o=>!o||o==='null'||allowedOrigins.includes(o)||/\.(powerbi|microsoft|office)\.com$/.test(o)
