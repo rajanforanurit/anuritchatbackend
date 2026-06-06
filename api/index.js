@@ -1941,19 +1941,115 @@ app.post('/api/web-search', requireClientKey, withRequestTimeout(async (req, res
     }
   }
 }))
-let results
-try {
-  results = await searchExamples(query)
-} catch (searchErr) {
-  // This will now show the real DDG error in Vercel logs
-  console.error('[web-search] searchExamples failed:', searchErr.message, searchErr.stack)
-  return res.status(200).json({
-    success: false,
-    query,
-    error: 'Web search is temporarily unavailable. Please try again later.',
-    results: [],
-  })
-}
+
+app.get('/debug/web-search', async (req, res) => {
+  const query = req.query.q || 'occupancy rate example'
+  const log = []
+
+  log.push(`[1] Starting search for: "${query}"`)
+  log.push(`[2] Node version: ${process.version}`)
+  log.push(`[3] Platform: ${process.platform}`)
+  log.push(`[4] VERCEL env: ${process.env.VERCEL || 'not set'}`)
+
+  // Test 1: basic fetch to DDG
+  try {
+    log.push('[5] Testing fetch to DuckDuckGo...')
+    const controller = new AbortController()
+    const timer = setTimeout(() => controller.abort(), 8000)
+
+    const params = new URLSearchParams({
+      q: query,
+      kl: 'us-en',
+      kp: '-1',
+    })
+
+    const res2 = await fetch(
+      `https://html.duckduckgo.com/html/?${params.toString()}`,
+      {
+        signal: controller.signal,
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+          'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+          'Accept-Language': 'en-US,en;q=0.5',
+          'Referer': 'https://duckduckgo.com/',
+        },
+      }
+    )
+    clearTimeout(timer)
+
+    log.push(`[6] DDG HTTP status: ${res2.status} ${res2.statusText}`)
+    log.push(`[7] DDG headers: ${JSON.stringify(Object.fromEntries(res2.headers.entries()))}`)
+
+    const html = await res2.text()
+    log.push(`[8] DDG response length: ${html.length} chars`)
+    log.push(`[9] DDG response preview (first 500 chars): ${html.slice(0, 500)}`)
+
+    // Check if blocked
+    if (html.includes('blocked') || html.includes('unusual traffic') || html.includes('captcha')) {
+      log.push('[10] ⚠️  DDG appears to be BLOCKING this request (captcha/unusual traffic detected)')
+    } else if (html.includes('result__a')) {
+      log.push('[10] ✅ DDG returned real results (result__a class found)')
+    } else if (html.includes('no results')) {
+      log.push('[10] ⚠️  DDG returned no results page')
+    } else {
+      log.push('[10] ❓ DDG response does not contain expected result markup')
+    }
+
+    // Try parse
+    const titleMatches = [...html.matchAll(/<a[^>]+class="[^"]*result__a[^"]*"[^>]+href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/gi)]
+    log.push(`[11] Parsed result count: ${titleMatches.length}`)
+
+    if (titleMatches.length > 0) {
+      log.push(`[12] First result title: ${titleMatches[0][2].replace(/<[^>]+>/g, '').trim()}`)
+      log.push(`[13] First result URL: ${titleMatches[0][1]}`)
+    }
+
+  } catch (err) {
+    log.push(`[ERROR] Fetch failed: ${err.name}: ${err.message}`)
+    log.push(`[ERROR] Stack: ${err.stack}`)
+
+    // Diagnose common errors
+    if (err.name === 'AbortError') {
+      log.push('[DIAGNOSIS] Request TIMED OUT after 8 seconds — DDG is not reachable from Vercel')
+    } else if (err.message.includes('ENOTFOUND')) {
+      log.push('[DIAGNOSIS] DNS RESOLUTION FAILED — Vercel cannot resolve html.duckduckgo.com')
+    } else if (err.message.includes('ECONNREFUSED')) {
+      log.push('[DIAGNOSIS] CONNECTION REFUSED — DDG actively refusing connections from Vercel IPs')
+    } else if (err.message.includes('ECONNRESET')) {
+      log.push('[DIAGNOSIS] CONNECTION RESET — DDG is dropping connections from Vercel')
+    } else if (err.message.includes('certificate') || err.message.includes('SSL')) {
+      log.push('[DIAGNOSIS] SSL/TLS ERROR — certificate issue')
+    } else {
+      log.push('[DIAGNOSIS] UNKNOWN ERROR — check stack trace above')
+    }
+  }
+
+  // Test 2: also try plain duckduckgo.com to compare
+  try {
+    log.push('[14] Testing plain fetch to duckduckgo.com homepage...')
+    const r = await fetch('https://duckduckgo.com/', {
+      headers: { 'User-Agent': 'Mozilla/5.0' },
+      signal: AbortSignal.timeout(5000),
+    })
+    log.push(`[15] duckduckgo.com homepage status: ${r.status}`)
+  } catch (err2) {
+    log.push(`[15] duckduckgo.com homepage FAILED: ${err2.message}`)
+  }
+
+  // Test 3: try google to confirm general outbound internet works
+  try {
+    log.push('[16] Testing outbound internet (google.com)...')
+    const r = await fetch('https://www.google.com/', {
+      headers: { 'User-Agent': 'Mozilla/5.0' },
+      signal: AbortSignal.timeout(5000),
+    })
+    log.push(`[17] google.com status: ${r.status} — ✅ outbound internet IS working`)
+  } catch (err3) {
+    log.push(`[17] google.com FAILED: ${err3.message} — ❌ outbound internet may be blocked`)
+  }
+
+  res.json({ query, log })
+})
 
 app.use((err,req,res,next)=>{console.error('[global error]',err);if(!res.headersSent) res.status(500).json({error:'Unexpected error.'})})
 if(process.env.VERCEL!=='1'){
