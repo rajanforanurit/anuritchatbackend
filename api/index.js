@@ -1905,33 +1905,36 @@ res.json({...result,conversationId:cid})
 }catch(e){console.error('[chat/message]',e.message);if(!res.headersSent) res.status(500).json({error:e.message})}
 }))
 app.post('/api/web-search', requireClientKey, withRequestTimeout(async (req, res) => {
-
   try {
-
     const { question, answer } = req.body
-
     if (!question || typeof question !== 'string' || !question.trim()) {
       return res.status(400).json({ success: false, error: 'question is required' })
     }
-
     const query = generateExampleSearchQuery(question.trim(), answer || '')
-
-    console.log(`[web-search] client=${req.client.clientId} question="${question.trim()}" generatedQuery="${query}"`)
-
-    const results = await searchExamples(query)
-
-    return res.json({ success: true, query, results })
-
-  } catch (e) {
-
-    console.error('[web-search] error:', e.message)
-
-    if (!res.headersSent) {
-      return res.status(500).json({ success: false, error: 'Web search failed. Please try again.' })
+    console.log(`[web-search] client=${req.client.clientId} question="${question.trim()}" query="${query}"`)
+    let results
+    try {
+      results = await searchExamples(query)
+    } catch (searchErr) {
+      console.error('[web-search] searchExamples failed:', searchErr.message)
+      return res.status(200).json({
+        success: false,
+        query,
+        error: 'Web search is temporarily unavailable. Please try again later.',
+        results: [],
+      })
     }
-
+    return res.json({ success: true, query, results })
+  } catch (e) {
+    console.error('[web-search] unexpected error:', e.message)
+    if (!res.headersSent) {
+      return res.status(200).json({
+        success: false,
+        error: 'Web search failed. Please try again.',
+        results: [],
+      })
+    }
   }
-
 }))
 app.use((err,req,res,next)=>{console.error('[global error]',err);if(!res.headersSent) res.status(500).json({error:'Unexpected error.'})})
 if(process.env.VERCEL!=='1'){
