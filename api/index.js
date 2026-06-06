@@ -1941,6 +1941,19 @@ app.post('/api/web-search', requireClientKey, withRequestTimeout(async (req, res
     }
   }
 }))
+let results
+try {
+  results = await searchExamples(query)
+} catch (searchErr) {
+  // This will now show the real DDG error in Vercel logs
+  console.error('[web-search] searchExamples failed:', searchErr.message, searchErr.stack)
+  return res.status(200).json({
+    success: false,
+    query,
+    error: 'Web search is temporarily unavailable. Please try again later.',
+    results: [],
+  })
+}
 
 app.use((err,req,res,next)=>{console.error('[global error]',err);if(!res.headersSent) res.status(500).json({error:'Unexpected error.'})})
 if(process.env.VERCEL!=='1'){
